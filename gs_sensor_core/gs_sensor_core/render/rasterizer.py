@@ -12,17 +12,19 @@ extracted here; phase 1 doesn't publish normals or distortion.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import torch
 
-from gs_sensor_core.culling import Octree, visible_point_mask
+from gs_sensor_core.culling import Octree, point_leaf_ids, visible_leaf_mask_torch, visible_point_mask
 from gs_sensor_core.models.gaussian_model import GaussianModel
 from gs_sensor_core.render.camera import RenderCamera
 from gs_sensor_core.sh_utils import C0, eval_sh
 
 _DEPTH_OFFSET = 0
 _ALPHA_OFFSET = 1
+_CULLING_BACKENDS = ("cpu", "gpu")
 
 
 @dataclass
@@ -30,29 +32,53 @@ class RenderOutput:
     rgb: torch.Tensor       # [3, H, W], float, ~[0, 1]
     depth: torch.Tensor     # [H, W], float, GS-training-space units
     num_rendered: int       # splats actually passed to the rasterizer this frame
+    timings: dict[str, float] | None = None  # stage -> ms, only populated when profile=True
 
 
 class GaussianRasterizerWrapper:
     """One instance per loaded model -- the model is loaded once, this is
     reused every frame with a new camera. `octree`/`culling_enabled` are
-    optional: with no octree, every splat is rendered every frame."""
+    optional: with no octree, every splat is rendered every frame.
+
+    `culling_backend`: "cpu" (default) runs the existing numpy octree test
+    and uploads the resulting point mask; "gpu" runs the same Gribb-Hartmann
+    test in torch directly on the camera's projection matrix, with no
+    GPU->CPU->GPU round trip. Left as a flag rather than a flat switch
+    because which one is actually faster depends on splat count vs. leaf
+    count vs. PCIe bandwidth on the target machine -- see the benchmark note
+    on `visible_point_mask` in culling.py. Measure with `profile=True`
+    before assuming either is a win."""
 
     def __init__(self, model: GaussianModel, device: str = "cuda",
-                 octree: Octree | None = None, culling_enabled: bool = True):
+                 octree: Octree | None = None, culling_enabled: bool = True,
+                 culling_backend: str = "cpu"):
         from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
         self._settings_cls = GaussianRasterizationSettings
         self._rasterizer_cls = GaussianRasterizer
+
+        if culling_backend not in _CULLING_BACKENDS:
+            raise ValueError(f"culling_backend must be one of {_CULLING_BACKENDS}, got {culling_backend!r}")
 
         self.model = model
         self.device = device
         self.octree = octree
         self.culling_enabled = culling_enabled
+        self.culling_backend = culling_backend
         self.background = torch.zeros(3, dtype=torch.float32, device=device)
         self.last_visible_count = model.num_points
+
+        self._node_aabbs_gpu = None
+        self._point_leaf_id_gpu = None
+        if culling_enabled and octree is not None and culling_backend == "gpu":
+            self._node_aabbs_gpu = torch.from_numpy(octree.node_aabbs).to(device)
+            self._point_leaf_id_gpu = torch.from_numpy(point_leaf_ids(octree)).to(device)
 
     def _visible_mask(self, camera: RenderCamera) -> torch.Tensor | None:
         if not (self.culling_enabled and self.octree is not None):
             return None
+        if self.culling_backend == "gpu":
+            leaf_vis = visible_leaf_mask_torch(self._node_aabbs_gpu, camera.full_proj_transform)
+            return leaf_vis[self._point_leaf_id_gpu]
         full_proj_np = camera.full_proj_transform.detach().cpu().numpy()
         mask_np = visible_point_mask(self.octree, full_proj_np, self.model.num_points)
         return torch.from_numpy(mask_np).to(self.device)
@@ -67,26 +93,41 @@ class GaussianRasterizerWrapper:
             return torch.clamp_min(colors + 0.5, 0.0)
         return torch.clamp_min(C0 * shs[:, 0, :] + 0.5, 0.0)
 
-    def render(self, camera: RenderCamera) -> RenderOutput:
+    def _sync(self) -> None:
+        if self.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def render(self, camera: RenderCamera, profile: bool = False) -> RenderOutput:
+        # Stage timings cost a torch.cuda.synchronize() each -- normally the
+        # GPU pipeline overlaps across stages, so measuring per-stage wall
+        # time requires forcing sync points that wouldn't otherwise happen.
+        # Skipped entirely unless profile=True, so it doesn't tax the hot path.
+        timings: dict[str, float] | None = {} if profile else None
+        t = time.perf_counter()
+
+        def lap(name: str) -> None:
+            nonlocal t
+            if timings is None:
+                return
+            self._sync()
+            now = time.perf_counter()
+            timings[name] = (now - t) * 1000.0
+            t = now
+
         model = self.model
         mask = self._visible_mask(camera)
+        lap("cull")
 
-        if mask is not None:
-            means3D = model.get_xyz[mask]
-            opacity = model.get_opacity[mask]
-            scales = model.get_scaling[mask]
-            rotations = model.get_rotation[mask]
-            shs = model.get_features[mask]
-        else:
-            means3D = model.get_xyz
-            opacity = model.get_opacity
-            scales = model.get_scaling
-            rotations = model.get_rotation
-            shs = model.get_features
+        # render_fields masks the raw tensors before activating them, so
+        # this scales with visible count instead of total model size -- see
+        # GaussianModel.render_fields.
+        means3D, opacity, scales, rotations, shs = model.render_fields(mask)
+        lap("gather")
 
         self.last_visible_count = int(means3D.shape[0])
         means2D = torch.zeros_like(means3D)
         colors = self._compute_colors(means3D, shs, camera)
+        lap("sh_eval")
 
         raster_settings = self._settings_cls(
             image_height=int(camera.height),
@@ -114,9 +155,14 @@ class GaussianRasterizerWrapper:
             rotations=rotations,
             cov3D_precomp=None,
         )
+        lap("rasterize")
 
         alpha = allmap[_ALPHA_OFFSET:_ALPHA_OFFSET + 1]
         depth = torch.nan_to_num(
             allmap[_DEPTH_OFFSET:_DEPTH_OFFSET + 1] / alpha, nan=0.0, posinf=0.0, neginf=0.0
         )
-        return RenderOutput(rgb=rendered_image, depth=depth.squeeze(0), num_rendered=self.last_visible_count)
+        lap("depth_extract")
+        return RenderOutput(
+            rgb=rendered_image, depth=depth.squeeze(0),
+            num_rendered=self.last_visible_count, timings=timings,
+        )

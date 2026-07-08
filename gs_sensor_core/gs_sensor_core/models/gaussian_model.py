@@ -48,3 +48,22 @@ class GaussianModel:
     @property
     def num_points(self) -> int:
         return self.xyz.shape[0]
+
+    def render_fields(self, mask: torch.Tensor | None = None):
+        """(xyz, opacity, scaling, rotation, features), activated, restricted
+        to `mask` if given. Indexes the *raw* tensors before activating them
+        rather than activating-then-indexing (what naive `get_opacity[mask]`
+        etc. does) -- sigmoid/exp/normalize/cat are nontrivial per-point
+        ops, so doing them over the full model and discarding most of the
+        result makes their cost independent of how much culling actually
+        removes. This is why it belongs on the model, not the caller: only
+        this class knows which raw field maps to which activation."""
+        if mask is None:
+            return self.get_xyz, self.get_opacity, self.get_scaling, self.get_rotation, self.get_features
+        return (
+            self.xyz[mask],
+            torch.sigmoid(self.raw_opacity[mask]),
+            torch.exp(self.raw_scaling[mask]),
+            torch.nn.functional.normalize(self.raw_rotation[mask]),
+            torch.cat((self.features_dc[mask], self.features_rest[mask]), dim=1),
+        )

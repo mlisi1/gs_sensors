@@ -131,6 +131,48 @@ def visible_point_mask(octree: Octree, full_proj_transform: np.ndarray, n_points
     return mask
 
 
+def point_leaf_ids(octree: Octree) -> np.ndarray:
+    """Inverse of the leaf-order permutation: leaf id owning each point, in
+    original point order -- [N] int64. Precomputed once so GPU culling can
+    turn a leaf-visibility mask into a point mask with a single gather
+    instead of the per-frame Python loop `visible_point_mask` uses (that
+    loop wins on CPU, per the benchmark note above, but a gather is the
+    equivalent GPU-native op)."""
+    n_points = octree.flat_indices.shape[0]
+    ids = np.empty(n_points, dtype=np.int64)
+    for leaf in range(len(octree.node_offsets) - 1):
+        s, e = octree.node_offsets[leaf], octree.node_offsets[leaf + 1]
+        ids[octree.flat_indices[s:e]] = leaf
+    return ids
+
+
+def visible_leaf_mask_torch(node_aabbs, full_proj_transform):
+    """Same Gribb-Hartmann p-vertex test as `visible_leaf_mask`, but done in
+    torch on `full_proj_transform`'s own device -- no `.cpu()`/`.numpy()`
+    round trip. `node_aabbs` must already be a torch tensor on that device.
+    Local `import torch` keeps this module numpy-only unless this path is
+    actually used (see `culling_backend="gpu"` in rasterizer.py)."""
+    import torch
+
+    m = full_proj_transform
+    planes = torch.stack([
+        m[:, 0] + m[:, 3],  # left
+        m[:, 3] - m[:, 0],  # right
+        m[:, 1] + m[:, 3],  # bottom
+        m[:, 3] - m[:, 1],  # top
+        m[:, 2],            # near
+    ], dim=0)
+    normals, d_vals = planes[:, :3], planes[:, 3]
+
+    aabb_min = node_aabbs[:, :3]
+    aabb_max = node_aabbs[:, 3:]
+
+    pos_mask = normals.unsqueeze(1) >= 0  # [5, 1, 3]
+    p_vertex = torch.where(pos_mask, aabb_max.unsqueeze(0), aabb_min.unsqueeze(0))  # [5, L, 3]
+    dots = (p_vertex * normals.unsqueeze(1)).sum(dim=2) + d_vals.unsqueeze(1)
+    return (dots >= 0).all(dim=0)
+
+
 def index_cache_path(ply_path: str | Path) -> Path:
     """<ply_dir>/.gs_sensors/<ply_stem>.idx.npz"""
     ply_path = Path(ply_path)

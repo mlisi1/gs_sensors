@@ -29,6 +29,10 @@ def generate_launch_description():
                               description="Only used at compression_level 2"),
         DeclareLaunchArgument("culling_enabled", default_value="true",
                               description="Octree frustum culling"),
+        DeclareLaunchArgument("culling_backend", default_value="cpu",
+                              description="'cpu' (numpy, existing) or 'gpu' (torch-native, "
+                                          "no GPU->CPU->GPU round trip per frame) -- benchmark "
+                                          "with debug:=true before picking one"),
         DeclareLaunchArgument("build_index", default_value="false",
                               description="Build the octree index if no cached one exists yet"),
         DeclareLaunchArgument("leaf_max", default_value="5000",
@@ -43,6 +47,12 @@ def generate_launch_description():
         DeclareLaunchArgument("use_sim_time", default_value="true"),
         DeclareLaunchArgument("debug", default_value="false",
                               description="Print rendered/total splat count + timing once per second"),
+        DeclareLaunchArgument("enable_profiling", default_value="false",
+                              description="Per-stage render timing breakdown in the debug log "
+                                          "(cull/gather/sh_eval/rasterize/depth_extract/copy_to_cpu). "
+                                          "Costs real ms (forces a torch.cuda.synchronize() per stage) "
+                                          "-- separate from 'debug' so it's off by default; only takes "
+                                          "effect when debug:=true is also set, since that's what logs it"),
     ]
 
     node = Node(
@@ -60,6 +70,7 @@ def generate_launch_description():
             "compression_level": ParameterValue(LaunchConfiguration("compression_level"), value_type=int),
             "target_sh_degree": ParameterValue(LaunchConfiguration("target_sh_degree"), value_type=int),
             "culling_enabled": ParameterValue(LaunchConfiguration("culling_enabled"), value_type=bool),
+            "culling_backend": LaunchConfiguration("culling_backend"),
             "build_index": ParameterValue(LaunchConfiguration("build_index"), value_type=bool),
             "leaf_max": ParameterValue(LaunchConfiguration("leaf_max"), value_type=int),
             "publish_depth": ParameterValue(LaunchConfiguration("publish_depth"), value_type=bool),
@@ -69,6 +80,7 @@ def generate_launch_description():
             "camera_frame": LaunchConfiguration("camera_frame"),
             "use_sim_time": ParameterValue(LaunchConfiguration("use_sim_time"), value_type=bool),
             "debug": ParameterValue(LaunchConfiguration("debug"), value_type=bool),
+            "enable_profiling": ParameterValue(LaunchConfiguration("enable_profiling"), value_type=bool),
         }],
     )
 

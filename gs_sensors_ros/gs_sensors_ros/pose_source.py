@@ -7,10 +7,12 @@ localization stack sits in front of this node.
 """
 from __future__ import annotations
 
+import time
 from abc import ABC, abstractmethod
 
 import numpy as np
 from geometry_msgs.msg import PoseStamped
+from rclpy.callback_groups import CallbackGroup
 from rclpy.node import Node
 from rclpy.time import Time
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -26,11 +28,19 @@ class PoseSource(ABC):
 
 class GroundTruthPoseSource(PoseSource):
     """Subscribes to a geometry_msgs/PoseStamped bridged straight from Gazebo
-    (gz-sim-pose-publisher-system -> ros_gz_bridge)."""
+    (gz-sim-pose-publisher-system -> ros_gz_bridge).
 
-    def __init__(self, node: Node, topic: str):
+    `callback_group`: pass a group distinct from the render timer's so a
+    MultiThreadedExecutor can process an incoming pose while a render is
+    still in flight on the single-threaded-executor-blocking numpy/CUDA
+    work in the timer callback -- otherwise pose updates queue up behind
+    whatever render is currently running and every frame renders at a pose
+    that's stale by up to one render duration. See camera_debug_node.py."""
+
+    def __init__(self, node: Node, topic: str, callback_group: CallbackGroup | None = None):
         self._latest: Pose | None = None
-        node.create_subscription(PoseStamped, topic, self._on_pose, 10)
+        self._latest_received_at: float | None = None
+        node.create_subscription(PoseStamped, topic, self._on_pose, 10, callback_group=callback_group)
 
     def _on_pose(self, msg: PoseStamped) -> None:
         o = msg.pose.orientation
@@ -39,21 +49,38 @@ class GroundTruthPoseSource(PoseSource):
             position=np.array([p.x, p.y, p.z]),
             orientation=np.array([o.x, o.y, o.z, o.w]),
         )
+        self._latest_received_at = time.monotonic()
 
     def get_pose(self, stamp: Time) -> Pose | None:
         return self._latest
+
+    def pose_age_s(self) -> float | None:
+        """Wall-clock seconds since the cached pose was received -- a
+        debug-only diagnostic for measuring staleness at render time, not
+        part of the PoseSource interface (a TF lookup has no single
+        'latest' pose to measure staleness against the way a cached
+        subscription value does)."""
+        if self._latest_received_at is None:
+            return None
+        return time.monotonic() - self._latest_received_at
 
 
 class TFPoseSource(PoseSource):
     """Looks up `camera_frame` in `world_frame` via tf2 -- must be the
     camera's *optical* frame (REP 103: x-right, y-down, z-forward), not the
-    robot's base_link-style mounting frame."""
+    robot's base_link-style mounting frame.
+
+    `spin_thread=True`: TransformListener doesn't take a callback_group in
+    this tf2_ros version, so it gets its own dedicated thread/executor for
+    /tf and /tf_static instead -- same decoupling motivation as
+    GroundTruthPoseSource's callback_group (see its docstring): tf buffer
+    updates shouldn't stall behind an in-flight render."""
 
     def __init__(self, node: Node, world_frame: str, camera_frame: str):
         self._world_frame = world_frame
         self._camera_frame = camera_frame
         self._buffer = Buffer()
-        self._listener = TransformListener(self._buffer, node)
+        self._listener = TransformListener(self._buffer, node, spin_thread=True)
 
     def get_pose(self, stamp: Time) -> Pose | None:
         try:
@@ -69,9 +96,10 @@ class TFPoseSource(PoseSource):
 
 
 def make_pose_source(node: Node, *, kind: str, ground_truth_topic: str,
-                      world_frame: str, camera_frame: str) -> PoseSource:
+                      world_frame: str, camera_frame: str,
+                      callback_group: CallbackGroup | None = None) -> PoseSource:
     if kind == "ground_truth":
-        return GroundTruthPoseSource(node, ground_truth_topic)
+        return GroundTruthPoseSource(node, ground_truth_topic, callback_group=callback_group)
     if kind == "tf":
         return TFPoseSource(node, world_frame, camera_frame)
     raise ValueError(f"Unknown pose_source kind: {kind!r} (expected 'ground_truth' or 'tf')")

@@ -11,6 +11,8 @@ from __future__ import annotations
 import time
 
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
@@ -36,6 +38,7 @@ class CameraDebugNode(Node):
         self.declare_parameter("compression_level", 0)
         self.declare_parameter("target_sh_degree", 1)
         self.declare_parameter("culling_enabled", True)
+        self.declare_parameter("culling_backend", "cpu")
         self.declare_parameter("build_index", False)
         self.declare_parameter("leaf_max", 5000)
         self.declare_parameter("camera_profile", "")
@@ -46,6 +49,7 @@ class CameraDebugNode(Node):
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("publish_depth", True)
         self.declare_parameter("debug", False)
+        self.declare_parameter("enable_profiling", False)
 
         ply_path_param = self.get_parameter("ply_path").value
         profile_path = self.get_parameter("camera_profile").value
@@ -84,6 +88,12 @@ class CameraDebugNode(Node):
 
         self._total_splats = model.num_points
         self._debug = bool(self.get_parameter("debug").value)
+        # Separate from `debug`: the per-stage breakdown forces a
+        # torch.cuda.synchronize() at each stage boundary, which costs real
+        # milliseconds by design (it defeats the GPU pipeline overlap it's
+        # trying to measure) -- keep it opt-in and off by default so a
+        # release build never pays for it just because debug logging is on.
+        self._enable_profiling = bool(self.get_parameter("enable_profiling").value)
 
         publish_depth = bool(self.get_parameter("publish_depth").value)
         self.rasterizer = CameraRasterizer(
@@ -92,8 +102,15 @@ class CameraDebugNode(Node):
             publish_depth=publish_depth,
             octree=octree,
             culling_enabled=culling_enabled,
+            culling_backend=self.get_parameter("culling_backend").value,
         )
 
+        # A dedicated group, distinct from the timer's default one, so a
+        # MultiThreadedExecutor (see main()) can process an incoming pose
+        # while a render is still running in the timer callback -- without
+        # this, pose updates queue up behind the render and every frame
+        # renders at a pose stale by up to one render duration.
+        pose_callback_group = MutuallyExclusiveCallbackGroup()
         camera_frame = self.get_parameter("camera_frame").value or self.profile.frame_id
         self.pose_source = make_pose_source(
             self,
@@ -101,6 +118,7 @@ class CameraDebugNode(Node):
             ground_truth_topic=self.get_parameter("ground_truth_topic").value,
             world_frame=self.get_parameter("world_frame").value,
             camera_frame=camera_frame,
+            callback_group=pose_callback_group,
         )
 
         self._image_pub = self.create_publisher(Image, "image_raw", 10)
@@ -124,21 +142,33 @@ class CameraDebugNode(Node):
             return
         self._first_pose_seen = True
 
+        # Sampled right where pose_world is consumed, before any rendering
+        # work -- this is the number that actually says whether the pose
+        # used for this frame was fresh or stuck behind a prior render.
+        pose_age_s = getattr(self.pose_source, "pose_age_s", lambda: None)()
+
         pose_gs = self.gs_transform.apply(pose_world)
 
         t0 = time.perf_counter()
-        result = self.rasterizer.render(pose_gs)
+        result = self.rasterizer.render(pose_gs, profile=self._enable_profiling)
         elapsed_s = time.perf_counter() - t0
 
         if self._debug:
             # A dedicated flag rather than the ROS log-level mechanism --
             # --log-level debug also turns on rcl/rmw's own internal debug
-            # noise, which drowns out the one line we actually want.
-            self.get_logger().info(
+            # noise, which drowns out the one line we actually want. Reused
+            # to also gate per-stage profiling (extra torch.cuda.synchronize()
+            # calls) so it's never paid on the normal hot path.
+            msg = (
                 f"Rendered {result.num_rendered:,} / {self._total_splats:,} splats "
-                f"in {elapsed_s * 1000:.1f} ms",
-                throttle_duration_sec=1.0,
+                f"in {elapsed_s * 1000:.1f} ms"
             )
+            if result.timings:
+                breakdown = " ".join(f"{k}={v:.1f}ms" for k, v in result.timings.items())
+                msg += f" [{breakdown}]"
+            if pose_age_s is not None:
+                msg += f" (pose age {pose_age_s * 1000:.1f} ms)"
+            self.get_logger().info(msg, throttle_duration_sec=1.0)
 
         if elapsed_s > self._period_s:
             self.get_logger().warn(
@@ -168,8 +198,13 @@ class CameraDebugNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = CameraDebugNode()
+    # 2 threads: the render timer and the pose subscription each get their
+    # own callback group (see __init__) so one doesn't block the other --
+    # rclpy.spin()'s default SingleThreadedExecutor would serialize them.
+    executor = MultiThreadedExecutor(num_threads=2)
+    executor.add_node(node)
     try:
-        rclpy.spin(node)
+        executor.spin()
     finally:
         node.destroy_node()
         rclpy.shutdown()
