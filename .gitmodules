@@ -1,0 +1,3 @@
+[submodule "gs_sensor_core/third_party/diff-surfel-rasterization"]
+	path = gs_sensor_core/third_party/diff-surfel-rasterization
+	url = https://github.com/hbb1/diff-surfel-rasterization.git

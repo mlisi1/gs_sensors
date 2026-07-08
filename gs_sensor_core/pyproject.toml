@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gs-sensor-core"
+version = "0.1.0"
+description = "Rendering core for gs_sensors: pose in, sensor data out. Zero ROS/Gazebo imports."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "torch",
+    "pyyaml",
+    "plyfile",
+]
+
+# `diff-surfel-rasterization` (the CUDA tile-sort/alpha-composite kernel this
+# package renders with) is intentionally NOT listed here: it's a compiled
+# CUDA extension vendored as a git submodule at
+# third_party/diff-surfel-rasterization, built via its own setup.py (needs
+# nvcc + a matching torch/CUDA install). Build it once after
+# `git submodule update --init --recursive`:
+#   pip install -e gs_sensor_core/third_party/diff-surfel-rasterization
+# It carries the Inria Gaussian-Splatting research license (non-commercial
+# use only) -- see that submodule's LICENSE.md.
+
+[tool.setuptools.packages.find]
+include = ["gs_sensor_core*"]

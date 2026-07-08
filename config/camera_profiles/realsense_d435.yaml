@@ -1,0 +1,24 @@
+# RealSense D435 color stream, 640x480 @ 30 Hz.
+#
+# fx/fy are a real on-chip factory-calibration example reported from an
+# actual D435 unit's /camera/color/camera_info topic (see
+# https://github.com/IntelRealSense/librealsense/issues/2930 and
+# https://answers.ros.org/question/363236/), not fabricated placeholders.
+# RealSense factory calibration is per-unit -- if you're validating against
+# a specific physical camera, replace fx/fy with that unit's own camera_info.
+#
+# cx/cy are deliberately the *centered* principal point (width/2, height/2),
+# NOT that same unit's real cx/cy (313.39, 251.59). The rasterizer
+# (diff-surfel-rasterization) has no principal-point term at all -- its
+# projection matrix is built from fov alone, so it only ever renders a
+# centered principal point. Publishing the real off-center values here would
+# make CameraInfo claim precision the simulated image doesn't actually have.
+# See docs/coordinate_frames.md "Principal-point offset is not modeled".
+width: 640
+height: 480
+fx: 615.345153808594
+fy: 615.404357910156
+cx: 320.0
+cy: 240.0
+frame_id: camera_color_optical_frame
+update_rate: 30.0

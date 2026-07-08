@@ -1,0 +1,8 @@
+*.md
+__pycache__/
+test_data/
+test_package/
+log/
+install/
+build/
+*.egg-info
