@@ -9,14 +9,23 @@ nothing a config flag doesn't already give you, so it's left out here (see
 TODO.md if repeated-load time ever becomes a real problem).
 
 Level 0: no change.
-Level 1: fp16 round-trip on every field (precision preview / safety net --
-         does NOT reduce tensor size, matches upstream tooling's own
-         "same disk size" behavior for this level).
-Level 2: fp16 round-trip + SH `f_rest` truncated to `target_sh_degree`
-         (default 1) -- real reduction in tensor size and SH-eval cost.
-Level 3: fp16 round-trip + SH dropped entirely (degree 0, view-independent
-         color only) -- maximal reduction. int8-packing rotation/normals
-         for extra disk savings (as some viewers do) is intentionally not
+Level 1: every field genuinely stored as float16 -- halves the model's
+         resting VRAM footprint and (more importantly for render time) the
+         memory traffic `GaussianModel.render_fields` moves when masking/
+         gathering a frame's visible subset, since that's a bandwidth-bound
+         op. Activation math (sigmoid/exp/normalize in gaussian_model.py)
+         still runs in float32 -- render_fields upcasts right after
+         masking, before activating, so this produces numerically the
+         same values as computing everything in float32 on a once-
+         fp16-rounded input, just with less data actually moved. The
+         rasterizer CUDA kernel itself is hardcoded float32
+         (third_party/diff-surfel-rasterization), so this never reaches it
+         as fp16 regardless of level.
+Level 2: level 1 + SH `f_rest` truncated to `target_sh_degree` (default 1)
+         -- real reduction in tensor size and SH-eval cost on top.
+Level 3: level 1 + SH dropped entirely (degree 0, view-independent color
+         only) -- maximal reduction. int8-packing rotation/normals for
+         extra disk savings (as some viewers do) is intentionally not
          implemented -- see TODO.md.
 """
 from __future__ import annotations
@@ -27,12 +36,14 @@ FP16_MAX = 65504.0
 
 
 def to_fp16_safe(arr: np.ndarray, label: str = "") -> np.ndarray:
-    """Round-trip through float16 (NaN/Inf zeroed, overflow clipped at the
-    99.9th percentile first) -- returned as float32."""
+    """Converts to float16 (NaN/Inf zeroed, overflow clipped at the 99.9th
+    percentile first since fp16's dynamic range is much narrower than
+    fp32's -- see FP16_MAX). Returned as float16, genuinely smaller than
+    the input, not round-tripped back to float32."""
     arr = arr.astype(np.float32)
     n_bad = int(np.sum(~np.isfinite(arr)))
     if n_bad > 0:
-        print(f"[gs_sensor_core] {label}: zeroing {n_bad:,} NaN/Inf values before fp16 round-trip")
+        print(f"[gs_sensor_core] {label}: zeroing {n_bad:,} NaN/Inf values before fp16 conversion")
         arr = np.where(np.isfinite(arr), arr, 0.0)
     max_abs = float(np.abs(arr).max()) if arr.size else 0.0
     if max_abs > FP16_MAX:
@@ -40,7 +51,7 @@ def to_fp16_safe(arr: np.ndarray, label: str = "") -> np.ndarray:
         n_clip = int(np.sum(np.abs(arr) > threshold))
         print(f"[gs_sensor_core] {label}: clipping {n_clip:,} fp16-overflow values to ±{threshold:.1f}")
         arr = np.clip(arr, -threshold, threshold)
-    return arr.astype(np.float16).astype(np.float32)
+    return arr.astype(np.float16)
 
 
 def truncate_sh(features_rest: np.ndarray, current_degree: int, target_degree: int) -> tuple[np.ndarray, int]:

@@ -173,6 +173,37 @@ def visible_leaf_mask_torch(node_aabbs, full_proj_transform):
     return (dots >= 0).all(dim=0)
 
 
+def visible_point_mask_exact_torch(xyz, full_proj_transform, margin: float = 0.0):
+    """Exact per-point Gribb-Hartmann test against the same 5 planes as
+    `visible_leaf_mask`/`visible_leaf_mask_torch` (no far plane, same
+    rationale), but on point centers directly instead of a leaf's AABB --
+    a narrow-phase refinement meant to run only on the (much smaller)
+    candidate set that already passed the leaf-level broad phase, not the
+    full point cloud, so it stays cheap. See
+    GaussianRasterizerWrapper._narrow_phase_mask.
+
+    `margin`: this tests splat *centers*, which have zero screen-space
+    extent, unlike the splats actually being rendered -- at margin=0 a
+    splat can visibly pop out right as its center crosses the frustum edge,
+    before its rendered footprint has actually left the screen. Inflates
+    the plane test by this amount to compensate; tune from what you
+    actually see at the frame edges, this isn't derived from splat scale."""
+    import torch
+
+    m = full_proj_transform
+    planes = torch.stack([
+        m[:, 0] + m[:, 3],  # left
+        m[:, 3] - m[:, 0],  # right
+        m[:, 1] + m[:, 3],  # bottom
+        m[:, 3] - m[:, 1],  # top
+        m[:, 2],            # near
+    ], dim=0)
+    normals, d_vals = planes[:, :3], planes[:, 3]  # [5, 3], [5]
+
+    dots = xyz @ normals.T + d_vals  # [K, 5]
+    return (dots >= -margin).all(dim=1)
+
+
 def index_cache_path(ply_path: str | Path) -> Path:
     """<ply_dir>/.gs_sensors/<ply_stem>.idx.npz"""
     ply_path = Path(ply_path)

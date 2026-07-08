@@ -39,6 +39,8 @@ class CameraDebugNode(Node):
         self.declare_parameter("target_sh_degree", 1)
         self.declare_parameter("culling_enabled", True)
         self.declare_parameter("culling_backend", "cpu")
+        self.declare_parameter("culling_narrow_phase", False)
+        self.declare_parameter("culling_margin", 0.0)
         self.declare_parameter("build_index", False)
         self.declare_parameter("leaf_max", 5000)
         self.declare_parameter("camera_profile", "")
@@ -103,6 +105,8 @@ class CameraDebugNode(Node):
             octree=octree,
             culling_enabled=culling_enabled,
             culling_backend=self.get_parameter("culling_backend").value,
+            culling_narrow_phase=bool(self.get_parameter("culling_narrow_phase").value),
+            culling_margin=float(self.get_parameter("culling_margin").value),
         )
 
         # A dedicated group, distinct from the timer's default one, so a

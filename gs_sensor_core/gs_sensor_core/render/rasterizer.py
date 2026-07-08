@@ -17,7 +17,13 @@ from dataclasses import dataclass
 
 import torch
 
-from gs_sensor_core.culling import Octree, point_leaf_ids, visible_leaf_mask_torch, visible_point_mask
+from gs_sensor_core.culling import (
+    Octree,
+    point_leaf_ids,
+    visible_leaf_mask_torch,
+    visible_point_mask,
+    visible_point_mask_exact_torch,
+)
 from gs_sensor_core.models.gaussian_model import GaussianModel
 from gs_sensor_core.render.camera import RenderCamera
 from gs_sensor_core.sh_utils import C0, eval_sh
@@ -51,7 +57,8 @@ class GaussianRasterizerWrapper:
 
     def __init__(self, model: GaussianModel, device: str = "cuda",
                  octree: Octree | None = None, culling_enabled: bool = True,
-                 culling_backend: str = "cpu"):
+                 culling_backend: str = "cpu", culling_narrow_phase: bool = False,
+                 culling_margin: float = 0.0):
         from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
         self._settings_cls = GaussianRasterizationSettings
         self._rasterizer_cls = GaussianRasterizer
@@ -64,6 +71,8 @@ class GaussianRasterizerWrapper:
         self.octree = octree
         self.culling_enabled = culling_enabled
         self.culling_backend = culling_backend
+        self.culling_narrow_phase = culling_narrow_phase
+        self.culling_margin = culling_margin
         self.background = torch.zeros(3, dtype=torch.float32, device=device)
         self.last_visible_count = model.num_points
 
@@ -82,6 +91,23 @@ class GaussianRasterizerWrapper:
         full_proj_np = camera.full_proj_transform.detach().cpu().numpy()
         mask_np = visible_point_mask(self.octree, full_proj_np, self.model.num_points)
         return torch.from_numpy(mask_np).to(self.device)
+
+    def _narrow_phase_mask(self, mask: torch.Tensor, camera: RenderCamera) -> torch.Tensor:
+        """Exact per-point refinement of the leaf-level broad-phase `mask`,
+        restricted to points that already passed it -- the leaf test keeps
+        a whole leaf's points if the leaf's AABB merely touches the
+        frustum, so at scene edges this can be a real over-count. By
+        construction this can only ever remove points, never add any (it's
+        AND'd onto the broad-phase result), so it can't render something
+        the broad phase had already excluded."""
+        idx = torch.nonzero(mask, as_tuple=True)[0]
+        if idx.numel() == 0:
+            return mask
+        xyz_candidates = self.model.get_xyz[idx]
+        exact = visible_point_mask_exact_torch(xyz_candidates, camera.full_proj_transform, margin=self.culling_margin)
+        refined = torch.zeros_like(mask)
+        refined[idx] = exact
+        return refined
 
     def _compute_colors(self, means3D: torch.Tensor, shs: torch.Tensor, camera: RenderCamera) -> torch.Tensor:
         degree = self.model.active_sh_degree
@@ -117,6 +143,10 @@ class GaussianRasterizerWrapper:
         model = self.model
         mask = self._visible_mask(camera)
         lap("cull")
+
+        if mask is not None and self.culling_narrow_phase:
+            mask = self._narrow_phase_mask(mask, camera)
+        lap("narrow_cull")
 
         # render_fields masks the raw tensors before activating them, so
         # this scales with visible count instead of total model size -- see

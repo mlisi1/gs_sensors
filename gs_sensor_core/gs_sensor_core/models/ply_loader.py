@@ -112,7 +112,11 @@ def load_gaussian_model(
     arrays, degree = apply_compression(arrays, degree, compression_level, target_sh_degree)
 
     def to_device(arr: np.ndarray) -> torch.Tensor:
-        return torch.from_numpy(arr.astype(np.float32)).to(device)
+        # Preserves arr's own dtype (float32 normally, float16 when
+        # compression_level >= 1 -- see compression.py's to_fp16_safe)
+        # rather than forcing float32 here, which would silently undo the
+        # memory/bandwidth savings apply_compression just produced.
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(device)
 
     model = GaussianModel(
         xyz=to_device(arrays["xyz"]),

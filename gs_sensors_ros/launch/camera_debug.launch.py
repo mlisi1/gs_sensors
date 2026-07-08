@@ -33,6 +33,20 @@ def generate_launch_description():
                               description="'cpu' (numpy, existing) or 'gpu' (torch-native, "
                                           "no GPU->CPU->GPU round trip per frame) -- benchmark "
                                           "with debug:=true before picking one"),
+        DeclareLaunchArgument("culling_narrow_phase", default_value="false",
+                              description="Exact per-point frustum test on top of the leaf-level "
+                                          "one, restricted to points that already passed it -- "
+                                          "tightens the leaf test's over-inclusion at scene edges. "
+                                          "Measured close to a wash on real (spatially-coherent) "
+                                          "scenes, where octree leaves are already tight -- the "
+                                          "synthetic benchmark that motivated this used uniformly "
+                                          "random points, an AABB-looseness worst case that isn't "
+                                          "representative of trained-scene structure. Off by "
+                                          "default; may still help on sparser/scattered models"),
+        DeclareLaunchArgument("culling_margin", default_value="0.0",
+                              description="Slack added to the narrow-phase frustum test since it "
+                                          "checks splat centers, not their rendered footprint -- "
+                                          "raise from 0 if splats visibly pop at frame edges"),
         DeclareLaunchArgument("build_index", default_value="false",
                               description="Build the octree index if no cached one exists yet"),
         DeclareLaunchArgument("leaf_max", default_value="5000",
@@ -71,6 +85,8 @@ def generate_launch_description():
             "target_sh_degree": ParameterValue(LaunchConfiguration("target_sh_degree"), value_type=int),
             "culling_enabled": ParameterValue(LaunchConfiguration("culling_enabled"), value_type=bool),
             "culling_backend": LaunchConfiguration("culling_backend"),
+            "culling_narrow_phase": ParameterValue(LaunchConfiguration("culling_narrow_phase"), value_type=bool),
+            "culling_margin": ParameterValue(LaunchConfiguration("culling_margin"), value_type=float),
             "build_index": ParameterValue(LaunchConfiguration("build_index"), value_type=bool),
             "leaf_max": ParameterValue(LaunchConfiguration("leaf_max"), value_type=int),
             "publish_depth": ParameterValue(LaunchConfiguration("publish_depth"), value_type=bool),
