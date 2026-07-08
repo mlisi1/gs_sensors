@@ -41,6 +41,8 @@ def generate_launch_description():
         DeclareLaunchArgument("camera_frame", default_value="",
                               description="Defaults to the profile's frame_id if empty"),
         DeclareLaunchArgument("use_sim_time", default_value="true"),
+        DeclareLaunchArgument("debug", default_value="false",
+                              description="Print rendered/total splat count + timing once per second"),
     ]
 
     node = Node(
@@ -66,6 +68,7 @@ def generate_launch_description():
             "world_frame": LaunchConfiguration("world_frame"),
             "camera_frame": LaunchConfiguration("camera_frame"),
             "use_sim_time": ParameterValue(LaunchConfiguration("use_sim_time"), value_type=bool),
+            "debug": ParameterValue(LaunchConfiguration("debug"), value_type=bool),
         }],
     )
 

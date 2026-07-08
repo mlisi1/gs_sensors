@@ -45,6 +45,7 @@ class CameraDebugNode(Node):
         self.declare_parameter("world_frame", "world")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("publish_depth", True)
+        self.declare_parameter("debug", False)
 
         ply_path_param = self.get_parameter("ply_path").value
         profile_path = self.get_parameter("camera_profile").value
@@ -80,6 +81,9 @@ class CameraDebugNode(Node):
                 leaf_max=self.get_parameter("leaf_max").value,
                 build_index=bool(self.get_parameter("build_index").value),
             )
+
+        self._total_splats = model.num_points
+        self._debug = bool(self.get_parameter("debug").value)
 
         publish_depth = bool(self.get_parameter("publish_depth").value)
         self.rasterizer = CameraRasterizer(
@@ -125,6 +129,17 @@ class CameraDebugNode(Node):
         t0 = time.perf_counter()
         result = self.rasterizer.render(pose_gs)
         elapsed_s = time.perf_counter() - t0
+
+        if self._debug:
+            # A dedicated flag rather than the ROS log-level mechanism --
+            # --log-level debug also turns on rcl/rmw's own internal debug
+            # noise, which drowns out the one line we actually want.
+            self.get_logger().info(
+                f"Rendered {result.num_rendered:,} / {self._total_splats:,} splats "
+                f"in {elapsed_s * 1000:.1f} ms",
+                throttle_duration_sec=1.0,
+            )
+
         if elapsed_s > self._period_s:
             self.get_logger().warn(
                 f"Render took {elapsed_s * 1000:.1f} ms, over the "
