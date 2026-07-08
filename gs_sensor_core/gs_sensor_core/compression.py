@@ -54,6 +54,36 @@ def to_fp16_safe(arr: np.ndarray, label: str = "") -> np.ndarray:
     return arr.astype(np.float16)
 
 
+def prune_low_opacity(arrays: dict[str, np.ndarray], opacity_threshold: float) -> tuple[dict[str, np.ndarray], int]:
+    """Permanently drops splats with activated opacity <= opacity_threshold
+    -- not a compression technique (doesn't touch what survives, only
+    removes what doesn't), a one-time load-time prune of splats that are
+    already near-mathematically invisible. Motivated by comparing against
+    Kestrel (github.com/mlisi1/Kestrel), which defaults to exactly this at
+    threshold=0.05: on this project's real test model, over two-thirds of
+    all 7.19M splats have activated opacity <= 0.05 (median opacity across
+    the whole model is ~0.004), so this is not a marginal cut. Reduces N
+    itself -- helps every downstream stage (octree size, VRAM, per-frame
+    gather baseline), not just the specific frames a per-frame culling
+    technique happens to trim.
+
+    `arrays["opacity"]` is the raw (pre-sigmoid) field per ply_loader.py's
+    contract; sigmoid is applied here only to decide what to keep, the
+    stored field for whatever survives stays in its original raw form.
+
+    threshold <= 0.0 is a true no-op (returns arrays unchanged, 0 removed)
+    rather than "keep everything with opacity > 0" -- so the off-by-default
+    case really means off, not silently dropping exactly-zero-opacity
+    splats."""
+    if opacity_threshold <= 0.0:
+        return arrays, 0
+    activated_opacity = 1.0 / (1.0 + np.exp(-arrays["opacity"][:, 0].astype(np.float64)))
+    keep = activated_opacity > opacity_threshold
+    n_removed = int((~keep).sum())
+    pruned = {name: arr[keep] for name, arr in arrays.items()}
+    return pruned, n_removed
+
+
 def truncate_sh(features_rest: np.ndarray, current_degree: int, target_degree: int) -> tuple[np.ndarray, int]:
     """features_rest: [N, K, 3] with K = (current_degree+1)**2 - 1.
     Returns (truncated_features_rest, new_degree)."""

@@ -19,10 +19,9 @@ import torch
 
 from gs_sensor_core.culling import (
     Octree,
-    point_leaf_ids,
     visible_leaf_mask_torch,
-    visible_point_mask,
     visible_point_mask_exact_torch,
+    visible_point_mask_screen_size_torch,
 )
 from gs_sensor_core.models.gaussian_model import GaussianModel
 from gs_sensor_core.render.camera import RenderCamera
@@ -30,7 +29,10 @@ from gs_sensor_core.sh_utils import C0, eval_sh
 
 _DEPTH_OFFSET = 0
 _ALPHA_OFFSET = 1
-_CULLING_BACKENDS = ("cpu", "gpu")
+# Field order for the raw-tensor tuples passed around render() -- matches
+# GaussianModel._activate's positional args and GaussianModel's own
+# dataclass field order.
+_XYZ, _OPACITY, _SCALING, _ROTATION, _FEATURES_DC, _FEATURES_REST = range(6)
 
 
 @dataclass
@@ -46,68 +48,156 @@ class GaussianRasterizerWrapper:
     reused every frame with a new camera. `octree`/`culling_enabled` are
     optional: with no octree, every splat is rendered every frame.
 
-    `culling_backend`: "cpu" (default) runs the existing numpy octree test
-    and uploads the resulting point mask; "gpu" runs the same Gribb-Hartmann
-    test in torch directly on the camera's projection matrix, with no
-    GPU->CPU->GPU round trip. Left as a flag rather than a flat switch
-    because which one is actually faster depends on splat count vs. leaf
-    count vs. PCIe bandwidth on the target machine -- see the benchmark note
-    on `visible_point_mask` in culling.py. Measure with `profile=True`
-    before assuming either is a win."""
+    PRECONDITION when an octree is supplied: `model` must already be
+    permuted into that octree's leaf-contiguous order via
+    `model.reorder_(octree.flat_indices)` -- the caller's job (see
+    camera_debug_node.py), not this class's, since the model is loaded
+    before the octree exists. Without this, leaf j's points would not
+    actually be at `model.xyz[node_offsets[j]:node_offsets[j+1]]` and the
+    contiguous-slice gather below would silently gather the wrong splats.
+
+    Per-frame gather (_gather_leaf_slices) builds one index tensor covering
+    every leaf that passes the frustum test and does a single indexed
+    gather per field, instead of boolean-mask indexing the full model --
+    `tensor[bool_mask]` has to scan/compact the entire N-length mask
+    regardless of how few points survive, a real fixed cost that no amount
+    of tightening *what* got included ever reduced. This was motivated by
+    Kestrel's renderer.py (github.com/mlisi1/Kestrel), which reorders its
+    model once at load and gathers via contiguous per-leaf slices -- but
+    measured directly against this project's real model, a literal port of
+    that (a Python loop over visible leaves, each its own torch.cat) was
+    actually SLOWER than the boolean-mask approach it was meant to replace,
+    at the leaf counts a typical frame here actually has (a few hundred to
+    ~1600): per-leaf-piece launch overhead outweighed the bandwidth saved.
+    The single-index-gather form measured here instead is a real but
+    modest win (roughly 1.2-1.8x at typical splat counts, closer to
+    break-even at ~2M) -- Kestrel's own advantage, per informal comparison
+    against it, looks considerably larger than that, so this doesn't fully
+    close the gap; something else is likely still different (candidates:
+    Kestrel's much larger default leaf_max=170,000 vs. this project's
+    5,000, drastically reducing its per-frame leaf-piece count; or
+    something in the profiling itself). Don't treat this as "solved"."""
 
     def __init__(self, model: GaussianModel, device: str = "cuda",
                  octree: Octree | None = None, culling_enabled: bool = True,
-                 culling_backend: str = "cpu", culling_narrow_phase: bool = False,
-                 culling_margin: float = 0.0):
+                 culling_narrow_phase: bool = False, culling_margin: float = 0.0,
+                 screen_size_culling: bool = False, screen_size_min_pixels: float = 1.0,
+                 octree_lod: bool = False, lod_leaf_pixel_threshold: float = 16.0):
         from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
         self._settings_cls = GaussianRasterizationSettings
         self._rasterizer_cls = GaussianRasterizer
-
-        if culling_backend not in _CULLING_BACKENDS:
-            raise ValueError(f"culling_backend must be one of {_CULLING_BACKENDS}, got {culling_backend!r}")
 
         self.model = model
         self.device = device
         self.octree = octree
         self.culling_enabled = culling_enabled
-        self.culling_backend = culling_backend
         self.culling_narrow_phase = culling_narrow_phase
         self.culling_margin = culling_margin
+        self.screen_size_culling = screen_size_culling
+        self.screen_size_min_pixels = screen_size_min_pixels
+        self.octree_lod = octree_lod
+        self.lod_leaf_pixel_threshold = lod_leaf_pixel_threshold
         self.background = torch.zeros(3, dtype=torch.float32, device=device)
         self.last_visible_count = model.num_points
 
+        self._has_octree = culling_enabled and octree is not None
         self._node_aabbs_gpu = None
-        self._point_leaf_id_gpu = None
-        if culling_enabled and octree is not None and culling_backend == "gpu":
+        self._node_offsets_gpu = None
+        if self._has_octree:
             self._node_aabbs_gpu = torch.from_numpy(octree.node_aabbs).to(device)
-            self._point_leaf_id_gpu = torch.from_numpy(point_leaf_ids(octree)).to(device)
+            self._node_offsets_gpu = torch.from_numpy(octree.node_offsets).to(device)
 
-    def _visible_mask(self, camera: RenderCamera) -> torch.Tensor | None:
-        if not (self.culling_enabled and self.octree is not None):
-            return None
-        if self.culling_backend == "gpu":
-            leaf_vis = visible_leaf_mask_torch(self._node_aabbs_gpu, camera.full_proj_transform)
-            return leaf_vis[self._point_leaf_id_gpu]
-        full_proj_np = camera.full_proj_transform.detach().cpu().numpy()
-        mask_np = visible_point_mask(self.octree, full_proj_np, self.model.num_points)
-        return torch.from_numpy(mask_np).to(self.device)
+        self._proxy_xyz_gpu = None
+        self._proxy_scale_gpu = None
+        self._proxy_rotation_gpu = None
+        self._proxy_opacity_gpu = None
+        self._proxy_features_dc_gpu = None
+        self._leaf_center_gpu = None
+        self._leaf_radius_gpu = None
+        if self._has_octree and octree_lod and octree.has_lod:
+            self._proxy_xyz_gpu = torch.from_numpy(octree.proxy_xyz).to(device)
+            self._proxy_scale_gpu = torch.from_numpy(octree.proxy_scale).to(device)
+            self._proxy_rotation_gpu = torch.from_numpy(octree.proxy_rotation).to(device)
+            self._proxy_opacity_gpu = torch.from_numpy(octree.proxy_opacity).to(device)
+            self._proxy_features_dc_gpu = torch.from_numpy(octree.proxy_features_dc).to(device)
+            self._leaf_center_gpu = (self._node_aabbs_gpu[:, :3] + self._node_aabbs_gpu[:, 3:]) * 0.5
+            self._leaf_radius_gpu = (
+                (self._node_aabbs_gpu[:, 3:] - self._node_aabbs_gpu[:, :3]) * 0.5
+            ).amax(dim=-1, keepdim=True)
 
-    def _narrow_phase_mask(self, mask: torch.Tensor, camera: RenderCamera) -> torch.Tensor:
-        """Exact per-point refinement of the leaf-level broad-phase `mask`,
-        restricted to points that already passed it -- the leaf test keeps
-        a whole leaf's points if the leaf's AABB merely touches the
-        frustum, so at scene edges this can be a real over-count. By
-        construction this can only ever remove points, never add any (it's
-        AND'd onto the broad-phase result), so it can't render something
-        the broad phase had already excluded."""
-        idx = torch.nonzero(mask, as_tuple=True)[0]
-        if idx.numel() == 0:
-            return mask
-        xyz_candidates = self.model.get_xyz[idx]
-        exact = visible_point_mask_exact_torch(xyz_candidates, camera.full_proj_transform, margin=self.culling_margin)
-        refined = torch.zeros_like(mask)
-        refined[idx] = exact
-        return refined
+    def _gather_leaf_slices(self, leaf_mask: torch.Tensor):
+        """Builds one index tensor covering every True leaf's contiguous
+        point range in the model's own (reorder_-permuted) order, and does
+        a single `tensor[index]` gather per raw field -- touches only the
+        visible K points, never the full N. See class docstring for why
+        this (a single gather) rather than a Python loop of per-leaf
+        `torch.cat` pieces, which measured slower despite looking more
+        literally like the Kestrel implementation that motivated this.
+
+        `.item()` on the total visible-point count is a deliberate, small
+        sync -- building a variable-length index tensor is inherently
+        data-dependent, there's no way to avoid some sync here. What
+        matters is its payload is O(visible leaf count), a few thousand at
+        most, not O(N) -- the thing this whole approach replaces was an
+        O(N) sync/scan on *every* frame regardless of visibility."""
+        visible = torch.nonzero(leaf_mask, as_tuple=True)[0]
+        if visible.numel() == 0:
+            z = lambda t: t.new_zeros((0,) + t.shape[1:])
+            return (z(self.model.xyz), z(self.model.raw_opacity), z(self.model.raw_scaling),
+                    z(self.model.raw_rotation), z(self.model.features_dc), z(self.model.features_rest))
+        starts = self._node_offsets_gpu[visible]
+        ends = self._node_offsets_gpu[visible + 1]
+        lengths = ends - starts
+        total = int(lengths.sum().item())
+        idx = torch.repeat_interleave(starts, lengths) + (
+            torch.arange(total, device=starts.device)
+            - torch.repeat_interleave(torch.cumsum(lengths, 0) - lengths, lengths)
+        )
+        return (self.model.xyz[idx], self.model.raw_opacity[idx], self.model.raw_scaling[idx],
+                self.model.raw_rotation[idx], self.model.features_dc[idx], self.model.features_rest[idx])
+
+    def _lod_split(self, leaf_vis: torch.Tensor | None, camera: RenderCamera):
+        """Splits frustum-visible leaves into (leaf_fine, leaf_coarse)
+        based on each leaf's own projected screen size -- same pinhole
+        approximation as screen_size_culling (visible_point_mask_screen_
+        size_torch), applied to the whole leaf's extent instead of one
+        splat's. Returns (leaf_vis, None) unchanged if LOD isn't active
+        this frame (no octree, octree_lod off, or no proxies built)."""
+        if leaf_vis is None or not (self.octree_lod and self._proxy_xyz_gpu is not None):
+            return leaf_vis, None
+        focal_x = camera.width / (2.0 * math.tan(camera.fov_x * 0.5))
+        focal_y = camera.height / (2.0 * math.tan(camera.fov_y * 0.5))
+        # cutoff=1.0: leaf_radius is already a literal spatial extent (half
+        # the leaf's AABB diagonal), not a per-splat log-scale Gaussian
+        # sigma -- the function's default cutoff=3.0 is for the latter.
+        leaf_full_detail = visible_point_mask_screen_size_torch(
+            self._leaf_center_gpu, self._leaf_radius_gpu, camera.world_view_transform,
+            focal_x, focal_y, cutoff=1.0, min_pixel_radius=self.lod_leaf_pixel_threshold,
+        )
+        leaf_coarse = leaf_vis & ~leaf_full_detail
+        leaf_fine = leaf_vis & leaf_full_detail
+        return leaf_fine, leaf_coarse
+
+    def _append_proxies(self, leaf_coarse: torch.Tensor | None,
+                         means3D: torch.Tensor, opacity: torch.Tensor,
+                         scales: torch.Tensor, rotations: torch.Tensor):
+        """Concatenates coarse leaves' proxy splats onto the already-
+        activated full-detail tensors -- proxies are pre-activated (see
+        lod.py's build_leaf_proxies), so they skip GaussianModel._activate
+        entirely, just a gather. Returns the (possibly extended) tensors
+        plus proxy_idx (None if LOD isn't active this frame, an index
+        tensor -- possibly empty -- otherwise), which the caller needs
+        again for the matching color merge."""
+        if leaf_coarse is None:
+            return means3D, opacity, scales, rotations, None
+        proxy_idx = torch.nonzero(leaf_coarse, as_tuple=True)[0]
+        if proxy_idx.numel() == 0:
+            return means3D, opacity, scales, rotations, proxy_idx
+        means3D = torch.cat([means3D, self._proxy_xyz_gpu[proxy_idx]], dim=0)
+        opacity = torch.cat([opacity, self._proxy_opacity_gpu[proxy_idx]], dim=0)
+        scales = torch.cat([scales, self._proxy_scale_gpu[proxy_idx]], dim=0)
+        rotations = torch.cat([rotations, self._proxy_rotation_gpu[proxy_idx]], dim=0)
+        return means3D, opacity, scales, rotations, proxy_idx
 
     def _compute_colors(self, means3D: torch.Tensor, shs: torch.Tensor, camera: RenderCamera) -> torch.Tensor:
         degree = self.model.active_sh_degree
@@ -118,6 +208,18 @@ class GaussianRasterizerWrapper:
             colors = eval_sh(degree, shs.transpose(1, 2)[:, :, :sh_dim], dirs)
             return torch.clamp_min(colors + 0.5, 0.0)
         return torch.clamp_min(C0 * shs[:, 0, :] + 0.5, 0.0)
+
+    def _colors_with_proxies(self, means3D_full: torch.Tensor, shs: torch.Tensor,
+                              camera: RenderCamera, proxy_idx: torch.Tensor | None) -> torch.Tensor:
+        """Real splats go through the usual SH eval; proxies are pre-
+        collapsed to a single DC term (build_leaf_proxies), so they use the
+        same degree-0 color formula _compute_colors uses for a real
+        degree-0 model, skipping SH eval/view-direction math entirely."""
+        colors = self._compute_colors(means3D_full, shs, camera)
+        if proxy_idx is not None and proxy_idx.numel() > 0:
+            proxy_colors = torch.clamp_min(C0 * self._proxy_features_dc_gpu[proxy_idx, 0, :] + 0.5, 0.0)
+            colors = torch.cat([colors, proxy_colors], dim=0)
+        return colors
 
     def _sync(self) -> None:
         if self.device.startswith("cuda") and torch.cuda.is_available():
@@ -141,22 +243,60 @@ class GaussianRasterizerWrapper:
             t = now
 
         model = self.model
-        mask = self._visible_mask(camera)
+
+        leaf_vis = None
+        if self._has_octree:
+            leaf_vis = visible_leaf_mask_torch(self._node_aabbs_gpu, camera.full_proj_transform)
         lap("cull")
 
-        if mask is not None and self.culling_narrow_phase:
-            mask = self._narrow_phase_mask(mask, camera)
+        leaf_fine, leaf_coarse = self._lod_split(leaf_vis, camera)
+        lap("lod_select")
+
+        # Brute force (no octree, or culling disabled) falls back to the
+        # raw model tensors directly -- the only place a full N-sized
+        # tensor is still touched on the per-frame hot path.
+        raw = (
+            self._gather_leaf_slices(leaf_fine) if leaf_fine is not None else
+            (model.xyz, model.raw_opacity, model.raw_scaling,
+             model.raw_rotation, model.features_dc, model.features_rest)
+        )
+
+        def filter_raw(keep: torch.Tensor) -> None:
+            nonlocal raw
+            raw = tuple(field[keep] for field in raw)
+
+        if self.culling_narrow_phase and leaf_fine is not None:
+            # Exact per-point frustum test on the already leaf-gathered
+            # candidates (K-sized, not N). Operates on raw (possibly fp16)
+            # xyz upcast just for the test, same reasoning as
+            # GaussianModel.render_fields: touch only the candidates.
+            keep = visible_point_mask_exact_torch(
+                raw[_XYZ].float(), camera.full_proj_transform, margin=self.culling_margin)
+            filter_raw(keep)
         lap("narrow_cull")
 
-        # render_fields masks the raw tensors before activating them, so
-        # this scales with visible count instead of total model size -- see
-        # GaussianModel.render_fields.
-        means3D, opacity, scales, rotations, shs = model.render_fields(mask)
+        if self.screen_size_culling and leaf_fine is not None:
+            focal_x = camera.width / (2.0 * math.tan(camera.fov_x * 0.5))
+            focal_y = camera.height / (2.0 * math.tan(camera.fov_y * 0.5))
+            keep = visible_point_mask_screen_size_torch(
+                raw[_XYZ].float(), torch.exp(raw[_SCALING].float()), camera.world_view_transform,
+                focal_x, focal_y, min_pixel_radius=self.screen_size_min_pixels,
+            )
+            filter_raw(keep)
+        lap("screen_size_cull")
+
+        # render_fields' underlying activation (sigmoid/exp/normalize) runs
+        # on this already-culled candidate set, not the full model -- see
+        # GaussianModel._activate.
+        means3D, opacity, scales, rotations, shs = model._activate(*raw)
+        n_full = means3D.shape[0]
+        means3D, opacity, scales, rotations, proxy_idx = self._append_proxies(
+            leaf_coarse, means3D, opacity, scales, rotations)
         lap("gather")
 
         self.last_visible_count = int(means3D.shape[0])
         means2D = torch.zeros_like(means3D)
-        colors = self._compute_colors(means3D, shs, camera)
+        colors = self._colors_with_proxies(means3D[:n_full], shs, camera, proxy_idx)
         lap("sh_eval")
 
         raster_settings = self._settings_cls(

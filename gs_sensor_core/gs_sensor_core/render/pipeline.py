@@ -32,16 +32,19 @@ class CameraRasterizer:
     def __init__(self, model: GaussianModel, profile: CameraProfile,
                  gs_scale: float = 1.0, publish_depth: bool = True, device: str = "cuda",
                  octree: Octree | None = None, culling_enabled: bool = True,
-                 culling_backend: str = "cpu", culling_narrow_phase: bool = False,
-                 culling_margin: float = 0.0):
+                 culling_narrow_phase: bool = False, culling_margin: float = 0.0,
+                 screen_size_culling: bool = False, screen_size_min_pixels: float = 1.0,
+                 octree_lod: bool = False, lod_leaf_pixel_threshold: float = 16.0):
         self.profile = profile
         self.gs_scale = gs_scale
         self.publish_depth = publish_depth
         self.device = device
         self._rasterizer = GaussianRasterizerWrapper(
             model, device=device, octree=octree, culling_enabled=culling_enabled,
-            culling_backend=culling_backend, culling_narrow_phase=culling_narrow_phase,
-            culling_margin=culling_margin)
+            culling_narrow_phase=culling_narrow_phase,
+            culling_margin=culling_margin, screen_size_culling=screen_size_culling,
+            screen_size_min_pixels=screen_size_min_pixels, octree_lod=octree_lod,
+            lod_leaf_pixel_threshold=lod_leaf_pixel_threshold)
 
     def render(self, pose_gs: Pose, profile: bool = False) -> RenderResult:
         """`pose_gs` must already be in GS-training space (see frames.py) and

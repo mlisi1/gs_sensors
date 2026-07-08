@@ -26,7 +26,7 @@ import numpy as np
 import torch
 from plyfile import PlyData
 
-from gs_sensor_core.compression import apply_compression
+from gs_sensor_core.compression import apply_compression, prune_low_opacity
 from gs_sensor_core.models.gaussian_model import GaussianModel
 
 
@@ -77,9 +77,13 @@ def load_gaussian_model(
     device: str = "cuda",
     compression_level: int = 0,
     target_sh_degree: int = 1,
+    opacity_threshold: float = 0.0,
 ) -> GaussianModel:
     """compression_level: 0 (none) - 3 (aggressive), see compression.py.
-    target_sh_degree only applies at compression_level 2."""
+    target_sh_degree only applies at compression_level 2. opacity_threshold:
+    0.0 (default, off) permanently drops splats at/under this activated
+    opacity when loading -- see compression.py's prune_low_opacity for why
+    this can be a large fraction of a real model."""
     ply_path = str(path)
     el = PlyData.read(ply_path).elements[0]
 
@@ -109,6 +113,9 @@ def load_gaussian_model(
         "xyz": xyz, "opacity": opacity, "scaling": scaling,
         "rotation": rotation, "features_dc": features_dc, "features_rest": features_rest,
     }
+    # Before compression, not after: pruning shrinks N, so compression
+    # (fp16 conversion, SH truncation) then has less to do.
+    arrays, n_pruned = prune_low_opacity(arrays, opacity_threshold)
     arrays, degree = apply_compression(arrays, degree, compression_level, target_sh_degree)
 
     def to_device(arr: np.ndarray) -> torch.Tensor:
@@ -127,6 +134,7 @@ def load_gaussian_model(
         features_rest=to_device(arrays["features_rest"]),
         active_sh_degree=degree,
     )
+    prune_note = f", pruned {n_pruned:,} at opacity<={opacity_threshold}" if n_pruned else ""
     print(f"[gs_sensor_core] Loaded {model.num_points:,} splats (SH degree {degree}, "
-          f"compression level {compression_level}) from {ply_path}")
+          f"compression level {compression_level}{prune_note}) from {ply_path}")
     return model

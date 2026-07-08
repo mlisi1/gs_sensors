@@ -58,6 +58,20 @@ class GaussianModel:
     def num_points(self) -> int:
         return self.xyz.shape[0]
 
+    @staticmethod
+    def _activate(xyz, raw_opacity, raw_scaling, raw_rotation, features_dc, features_rest):
+        """Shared by render_fields (boolean-mask path) and
+        GaussianRasterizerWrapper's contiguous-slice-gather path (see
+        reorder_) -- same activation formulas, different way of arriving at
+        the (already-reduced-to-candidates) raw tensors fed in here."""
+        return (
+            xyz.float(),
+            torch.sigmoid(raw_opacity.float()),
+            torch.exp(raw_scaling.float()),
+            torch.nn.functional.normalize(raw_rotation.float()),
+            torch.cat((features_dc.float(), features_rest.float()), dim=1),
+        )
+
     def render_fields(self, mask: torch.Tensor | None = None):
         """(xyz, opacity, scaling, rotation, features), activated, restricted
         to `mask` if given. Indexes the *raw* tensors before activating them
@@ -73,13 +87,38 @@ class GaussianModel:
         activation math (sigmoid/exp/normalize) still always runs in
         float32 on the upcast result -- numerically the same as computing
         everything in float32 on a once-fp16-rounded input, just touching
-        less memory to get there."""
+        less memory to get there.
+
+        Boolean-mask indexing here is O(N) regardless of mask sparsity (it
+        has to scan/compact the full N-length mask) -- fine for the
+        brute-force (mask=None) and no-octree cases this is still used for,
+        but GaussianRasterizerWrapper's main per-frame path no longer calls
+        this with a mask; see its _gather_leaf_slices, which reaches
+        _activate directly with contiguous-slice-gathered (not
+        boolean-masked) raw tensors instead, for exactly this reason."""
         if mask is None:
-            return self.get_xyz, self.get_opacity, self.get_scaling, self.get_rotation, self.get_features
-        return (
-            self.xyz[mask].float(),
-            torch.sigmoid(self.raw_opacity[mask].float()),
-            torch.exp(self.raw_scaling[mask].float()),
-            torch.nn.functional.normalize(self.raw_rotation[mask].float()),
-            torch.cat((self.features_dc[mask].float(), self.features_rest[mask].float()), dim=1),
+            return self._activate(self.xyz, self.raw_opacity, self.raw_scaling,
+                                   self.raw_rotation, self.features_dc, self.features_rest)
+        return self._activate(
+            self.xyz[mask], self.raw_opacity[mask], self.raw_scaling[mask],
+            self.raw_rotation[mask], self.features_dc[mask], self.features_rest[mask],
         )
+
+    def reorder_(self, perm: torch.Tensor) -> None:
+        """In-place permutation of every raw per-splat tensor -- called
+        once at load time (not per-frame) to put the model into an
+        octree's leaf-contiguous order (perm = that octree's
+        flat_indices), so a leaf's points become directly sliceable as
+        model.xyz[node_offsets[j]:node_offsets[j+1]] with no further
+        indirection. This is what makes GaussianRasterizerWrapper's
+        contiguous-slice gather possible instead of boolean-mask indexing
+        -- see culling.py's module docstring and Kestrel's renderer.py
+        (the prior art this mirrors) for why that distinction matters:
+        boolean masking is O(N) to compact regardless of how few points
+        survive, contiguous slicing of a pre-sorted array is not."""
+        self.xyz = self.xyz[perm].contiguous()
+        self.raw_opacity = self.raw_opacity[perm].contiguous()
+        self.raw_scaling = self.raw_scaling[perm].contiguous()
+        self.raw_rotation = self.raw_rotation[perm].contiguous()
+        self.features_dc = self.features_dc[perm].contiguous()
+        self.features_rest = self.features_rest[perm].contiguous()

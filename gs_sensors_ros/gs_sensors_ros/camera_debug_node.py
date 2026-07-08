@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 
 import rclpy
+import torch
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
@@ -23,6 +24,7 @@ from gs_sensor_core.frames import GSFrameTransform, load_gs_frame_transform
 from gs_sensor_core.models import load_gaussian_model, resolve_ply_path
 from gs_sensor_core.render import CameraRasterizer
 
+from gs_sensors_ros import debug_view
 from gs_sensors_ros.pose_source import make_pose_source
 from gs_sensors_ros.ros_conversions import depth_to_image_msg, profile_to_camera_info, rgb_to_image_msg
 
@@ -32,17 +34,26 @@ class CameraDebugNode(Node):
     def __init__(self):
         super().__init__("camera_debug_node")
 
+        # Model loading / compression
         self.declare_parameter("ply_path", "")
         self.declare_parameter("iterations", 30000)
         self.declare_parameter("sh_degree", -1)
         self.declare_parameter("compression_level", 0)
         self.declare_parameter("target_sh_degree", 1)
+        self.declare_parameter("opacity_threshold", 0.0)
+
+        # Culling / LOD (see gs_sensor_core/culling.py, lod.py, render/rasterizer.py)
         self.declare_parameter("culling_enabled", True)
-        self.declare_parameter("culling_backend", "cpu")
         self.declare_parameter("culling_narrow_phase", False)
         self.declare_parameter("culling_margin", 0.0)
+        self.declare_parameter("screen_size_culling", False)
+        self.declare_parameter("screen_size_min_pixels", 1.0)
+        self.declare_parameter("octree_lod", False)
+        self.declare_parameter("lod_leaf_pixel_threshold", 16.0)
         self.declare_parameter("build_index", False)
         self.declare_parameter("leaf_max", 5000)
+
+        # Camera / pose source
         self.declare_parameter("camera_profile", "")
         self.declare_parameter("gs_frame_transform", "")
         self.declare_parameter("pose_source", "ground_truth")
@@ -50,8 +61,12 @@ class CameraDebugNode(Node):
         self.declare_parameter("world_frame", "world")
         self.declare_parameter("camera_frame", "")
         self.declare_parameter("publish_depth", True)
+
+        # Debug / diagnostics
         self.declare_parameter("debug", False)
         self.declare_parameter("enable_profiling", False)
+        self.declare_parameter("debug_view", False)
+        self.declare_parameter("debug_view_max_depth_m", 10.0)
 
         ply_path_param = self.get_parameter("ply_path").value
         profile_path = self.get_parameter("camera_profile").value
@@ -76,17 +91,36 @@ class CameraDebugNode(Node):
             sh_degree=self.get_parameter("sh_degree").value,
             compression_level=self.get_parameter("compression_level").value,
             target_sh_degree=self.get_parameter("target_sh_degree").value,
+            opacity_threshold=float(self.get_parameter("opacity_threshold").value),
         )
 
         culling_enabled = bool(self.get_parameter("culling_enabled").value)
+        octree_lod = bool(self.get_parameter("octree_lod").value)
         octree = None
         if culling_enabled:
+            # LOD proxies need opacity/scale/rotation/features_dc too, not
+            # just xyz -- only pulled from the model (extra GPU->CPU copies)
+            # when octree_lod is actually requested.
             octree = load_or_build_octree(
                 ply_path,
                 model.get_xyz.detach().cpu().numpy(),
                 leaf_max=self.get_parameter("leaf_max").value,
                 build_index=bool(self.get_parameter("build_index").value),
+                compute_lod=octree_lod,
+                opacity=model.get_opacity.detach().cpu().numpy() if octree_lod else None,
+                scale=model.get_scaling.detach().cpu().numpy() if octree_lod else None,
+                rotation=model.get_rotation.detach().cpu().numpy() if octree_lod else None,
+                features_dc=model.features_dc.detach().cpu().numpy() if octree_lod else None,
+                opacity_threshold=float(self.get_parameter("opacity_threshold").value),
             )
+            # Required precondition for GaussianRasterizerWrapper's
+            # contiguous-slice gather (see its class docstring): without
+            # this, leaf j's points wouldn't actually be at
+            # model.xyz[node_offsets[j]:node_offsets[j+1]], and gather
+            # would silently pull the wrong splats, not just be slow.
+            # One-time cost at startup, not per-frame.
+            perm = torch.from_numpy(octree.flat_indices).long().to(model.xyz.device)
+            model.reorder_(perm)
 
         self._total_splats = model.num_points
         self._debug = bool(self.get_parameter("debug").value)
@@ -96,6 +130,12 @@ class CameraDebugNode(Node):
         # trying to measure) -- keep it opt-in and off by default so a
         # release build never pays for it just because debug logging is on.
         self._enable_profiling = bool(self.get_parameter("enable_profiling").value)
+        # Opens an OpenCV window showing exactly what this node just
+        # rendered, bypassing ROS transport/RViz/rqt entirely -- a way to
+        # rule those out as the source of a smoothness problem, see
+        # debug_view.py.
+        self._debug_view = bool(self.get_parameter("debug_view").value)
+        self._debug_view_max_depth_m = float(self.get_parameter("debug_view_max_depth_m").value)
 
         publish_depth = bool(self.get_parameter("publish_depth").value)
         self.rasterizer = CameraRasterizer(
@@ -104,9 +144,12 @@ class CameraDebugNode(Node):
             publish_depth=publish_depth,
             octree=octree,
             culling_enabled=culling_enabled,
-            culling_backend=self.get_parameter("culling_backend").value,
             culling_narrow_phase=bool(self.get_parameter("culling_narrow_phase").value),
             culling_margin=float(self.get_parameter("culling_margin").value),
+            screen_size_culling=bool(self.get_parameter("screen_size_culling").value),
+            screen_size_min_pixels=float(self.get_parameter("screen_size_min_pixels").value),
+            octree_lod=octree_lod,
+            lod_leaf_pixel_threshold=float(self.get_parameter("lod_leaf_pixel_threshold").value),
         )
 
         # A dedicated group, distinct from the timer's default one, so a
@@ -189,6 +232,9 @@ class CameraDebugNode(Node):
                 throttle_duration_sec=5.0,
             )
 
+        if self._debug_view:
+            debug_view.show(result.rgb, result.depth, self._debug_view_max_depth_m)
+
         header = Header()
         header.stamp = stamp.to_msg()
         header.frame_id = self.profile.frame_id
@@ -210,6 +256,7 @@ def main(args=None):
     try:
         executor.spin()
     finally:
+        debug_view.close()
         node.destroy_node()
         rclpy.shutdown()
 
