@@ -14,12 +14,14 @@ from __future__ import annotations
 import time
 
 import rclpy
+import torch
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 
+from gs_sensor_core.culling import load_or_build_octree
 from gs_sensor_core.frames import GSFrameTransform, load_gs_frame_transform
 from gs_sensor_core.lidar_profiles.schema import LidarProfile
 from gs_sensor_core.models.lidar_checkpoint_loader import load_lidar_gaussian_model, load_raydrop_prior
@@ -43,6 +45,27 @@ class LidarDebugNode(Node):
         self.declare_parameter("raydrop_threshold", 0.5)
         self.declare_parameter("range_noise_stddev_m", 0.0)     # 0.0 = off, see LidarRasterizer
         self.declare_parameter("intensity_noise_stddev", 0.0)   # 0.0 = off, see LidarRasterizer
+        self.declare_parameter("opacity_threshold", 0.0)        # 0.0 = off, see LidarGaussianModel.prune_low_opacity_
+
+        # Culling / LOD (see gs_sensor_core/render/lidar/culling.py, lod.py --
+        # LOD, not visibility culling, is the lever that matches this
+        # sensor's actual bottleneck; see LidarRasterizer's class docstring).
+        # Defaults to OFF: measured directly against Crosslab_lidar
+        # (~474K splats, room-scale), the cull+gather machinery's own
+        # per-frame overhead exceeds its savings at conservative settings
+        # (default culling_margin_deg=5.0/lod_ray_pitch_cutoff=1.0 barely
+        # excludes anything at room-scale distances) -- real speedup only
+        # shows up at aggressive lod_ray_pitch_cutoff values that also cost
+        # real accuracy (range_MAE roughly doubles by cutoff=16), so this
+        # isn't a safe "just turn it on" default the way the camera
+        # branch's culling is. Opt in and tune deliberately; see TODO.md's
+        # "LiDAR branch" section for the actual before/after numbers.
+        self.declare_parameter("culling_enabled", False)
+        self.declare_parameter("culling_margin_deg", 5.0)
+        self.declare_parameter("octree_lod", False)
+        self.declare_parameter("lod_ray_pitch_cutoff", 1.0)
+        self.declare_parameter("build_index", False)
+        self.declare_parameter("leaf_max", 5000)
 
         # Sensor / pose
         self.declare_parameter("lidar_profile", "")
@@ -51,6 +74,13 @@ class LidarDebugNode(Node):
         self.declare_parameter("ground_truth_topic", "pose")
         self.declare_parameter("world_frame", "world")
         self.declare_parameter("lidar_frame", "")
+        # 0.0 = use the profile's own update_rate (the normal case: this
+        # value is baked into what the checkpoint was trained/tuned at,
+        # not a free knob) -- overriding it doesn't change the render
+        # itself, just how often it's triggered, so it's a legitimate way
+        # to probe how fast this pose/model/culling combination can
+        # actually go without editing the shared profile YAML.
+        self.declare_parameter("update_rate_override", 0.0)
 
         # Debug / diagnostics
         self.declare_parameter("debug", False)
@@ -71,8 +101,9 @@ class LidarDebugNode(Node):
             else GSFrameTransform.identity()
         )
 
+        opacity_threshold = float(self.get_parameter("opacity_threshold").value)
         self.get_logger().info(f"Loading GS-LiDAR checkpoint from {checkpoint_path} ...")
-        model = load_lidar_gaussian_model(checkpoint_path)
+        model = load_lidar_gaussian_model(checkpoint_path, opacity_threshold=opacity_threshold)
         raydrop_prior = load_raydrop_prior(raydrop_prior_path)
 
         refine_path = self.get_parameter("refine_unet_path").value
@@ -82,6 +113,37 @@ class LidarDebugNode(Node):
                 "No refine_unet_path given -- publishing raw (unrefined) raydrop mask. "
                 "GS-LiDAR's own eval always applies the refine UNet; expect a noisier/"
                 "denser point cloud than the validated pipeline.")
+
+        culling_enabled = bool(self.get_parameter("culling_enabled").value)
+        octree_lod = bool(self.get_parameter("octree_lod").value)
+        octree = None
+        if culling_enabled:
+            # LOD proxies need opacity/scale/rotation/features_dc too, not
+            # just xyz -- only pulled from the model (extra GPU->CPU
+            # copies) when octree_lod is actually requested.
+            # keep_normal_axis=True: this kernel is 3D-GS-family (genuine
+            # 3D extent per splat), not the camera branch's 2D-surfel one
+            # -- see lod.py's build_leaf_proxies docstring. checkpoint_path
+            # stands in for ply_path here purely for cache-file naming
+            # (index_cache_path isn't actually PLY-specific).
+            octree = load_or_build_octree(
+                checkpoint_path,
+                model.get_xyz.detach().cpu().numpy(),
+                leaf_max=self.get_parameter("leaf_max").value,
+                build_index=bool(self.get_parameter("build_index").value),
+                compute_lod=octree_lod,
+                opacity=model.get_opacity.detach().cpu().numpy() if octree_lod else None,
+                scale=model.get_scaling.detach().cpu().numpy() if octree_lod else None,
+                rotation=model.get_rotation.detach().cpu().numpy() if octree_lod else None,
+                features_dc=model.features_dc.detach().cpu().numpy() if octree_lod else None,
+                keep_normal_axis=True,
+                opacity_threshold=opacity_threshold,
+            )
+            # Required precondition for LidarRasterizer's contiguous-slice
+            # gather (see its class docstring) -- one-time cost at
+            # startup, not per-frame.
+            perm = torch.from_numpy(octree.flat_indices).long().to(model.xyz.device)
+            model.reorder_(perm)
 
         self._total_splats = model.num_points
         self._debug = bool(self.get_parameter("debug").value)
@@ -94,6 +156,11 @@ class LidarDebugNode(Node):
             raydrop_threshold=float(self.get_parameter("raydrop_threshold").value),
             range_noise_stddev_m=float(self.get_parameter("range_noise_stddev_m").value),
             intensity_noise_stddev=float(self.get_parameter("intensity_noise_stddev").value),
+            octree=octree,
+            culling_enabled=culling_enabled,
+            culling_margin_deg=float(self.get_parameter("culling_margin_deg").value),
+            octree_lod=octree_lod,
+            lod_ray_pitch_cutoff=float(self.get_parameter("lod_ray_pitch_cutoff").value),
         )
 
         # Same rationale as camera_debug_node.py: a dedicated callback group
@@ -112,7 +179,9 @@ class LidarDebugNode(Node):
 
         self._points_pub = self.create_publisher(PointCloud2, "points", 10)
 
-        self._period_s = 1.0 / self.profile.update_rate
+        update_rate_override = float(self.get_parameter("update_rate_override").value)
+        self._update_rate = update_rate_override if update_rate_override > 0.0 else self.profile.update_rate
+        self._period_s = 1.0 / self._update_rate
         self._first_pose_seen = False
         self._timer = self.create_timer(self._period_s, self._on_timer)
 
@@ -143,8 +212,20 @@ class LidarDebugNode(Node):
         elapsed_s = time.perf_counter() - t0
 
         if self._debug:
+            # result.num_rendered sums the prefilter-mask pass-count across
+            # BOTH panoramic passes (forward + backward) -- unlike the
+            # camera branch's single-pass equivalent, this is NOT bounded
+            # by _total_splats when culling/LOD are off (== _total_splats *
+            # 2 every frame in that case, every splat passes the
+            # opacity-only prefilter on both passes). "X / Y splats" reads
+            # as a bug (X > Y) if phrased like the camera branch's log line
+            # -- spelled out explicitly instead. With culling/LOD enabled
+            # this number reflects the actual (typically much smaller)
+            # post-cull/LOD candidate set for this frame's pose.
+            culling_note = "no culling/LOD" if self.rasterizer.octree is None else "culling/LOD active"
             msg = (
-                f"Rendered {result.num_rendered:,} / {self._total_splats:,} splats, "
+                f"Rendered {result.num_rendered:,} splat-evaluations across 2 passes "
+                f"(model: {self._total_splats:,} splats, {culling_note}), "
                 f"{result.num_returned:,} points returned, in {elapsed_s * 1000:.1f} ms"
             )
             if result.timings:
@@ -158,7 +239,7 @@ class LidarDebugNode(Node):
             self.get_logger().warn(
                 f"Render took {elapsed_s * 1000:.1f} ms, over the "
                 f"{self._period_s * 1000:.1f} ms frame budget at "
-                f"{self.profile.update_rate:.1f} Hz -- dropping frame timing",
+                f"{self._update_rate:.1f} Hz -- dropping frame timing",
                 throttle_duration_sec=5.0,
             )
         if result.num_returned == 0:

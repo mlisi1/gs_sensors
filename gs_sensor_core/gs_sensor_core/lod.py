@@ -46,6 +46,7 @@ def build_leaf_proxies(
     scale: np.ndarray,
     rotation: np.ndarray,
     features_dc: np.ndarray,
+    keep_normal_axis: bool = False,
 ):
     """Precomputes one merged 'proxy' Gaussian per octree leaf -- a
     moment-matched single-Gaussian reduction of the leaf's full splat set.
@@ -76,22 +77,31 @@ def build_leaf_proxies(
       wall segment collapses to a flat, not spherical, proxy) instead of
       an axis-aligned blob.
 
-    `scale` is genuinely 2D for this rasterizer, not 3D: the CUDA kernel's
-    own scale_to_mat (auxiliary.h) builds S = diag(scale.x, scale.y, 1.0)
-    -- the third entry is a fixed 1.0 placeholder purely so the rotation
-    matrix's third column can be read off as the surfel's normal, not a
-    real spatial extent (the normal direction carries zero variance).
-    `scale` may arrive here with 2 or 3 stored columns (ply_loader.py notes
-    some PLYs keep a vestigial third column) -- either way, the covariance
-    computed below zero-pads to a true (not kernel-placeholder) zero
-    variance along the normal, and the *output* proxy_scale is always 2
-    columns, since that's what this kernel actually accepts per splat (a
-    3-column scales tensor would desync the kernel's flat per-splat float
-    read, corrupting every splat after the first -- silently, not an
-    error). After eigendecomposition, the two largest-variance eigenvectors
-    become the proxy's in-plane tangent axes and the smallest becomes its
-    normal, matching the kernel's own column convention, not eigh's default
-    ascending order.
+    `scale` is genuinely 2D for the camera branch's surfel rasterizer, not
+    3D: its CUDA kernel's own scale_to_mat (auxiliary.h) builds
+    S = diag(scale.x, scale.y, 1.0) -- the third entry is a fixed 1.0
+    placeholder purely so the rotation matrix's third column can be read
+    off as the surfel's normal, not a real spatial extent (the normal
+    direction carries zero variance). `scale` may arrive here with 2 or 3
+    stored columns (ply_loader.py notes some PLYs keep a vestigial third
+    column) -- either way, the covariance computed below zero-pads to a
+    true (not kernel-placeholder) zero variance along the normal. By
+    default (`keep_normal_axis=False`) the *output* `proxy_scale` is 2
+    columns, matching that surfel kernel's per-splat float layout (a
+    3-column scales tensor would desync its flat per-splat read, corrupting
+    every splat after the first -- silently, not an error). Pass
+    `keep_normal_axis=True` for a genuinely-3D-GS-family kernel instead
+    (e.g. the LiDAR branch's vendored kernel, whose splats have no
+    surfel/degenerate-normal assumption -- `render/lidar/pipeline.py`'s
+    `_append_proxies` is the caller) to get all 3 eigenvalues back,
+    already in the same column order as `proxy_rotation`'s axes (see
+    below), so no further reordering is needed at that call site either.
+    After eigendecomposition, the two largest-variance eigenvectors become
+    the proxy's in-plane tangent axes and the smallest becomes its normal
+    (matching the surfel kernel's own column convention, not eigh's
+    default ascending order) -- kept as the compute order regardless of
+    `keep_normal_axis`, since it's also a reasonable, consistent axis
+    choice for a genuine 3D ellipsoid.
 
     Fully vectorized over all N points via `flat_indices`'s leaf-contiguous
     ordering + `np.add.reduceat`/`np.multiply.reduceat` per-leaf segment
@@ -146,7 +156,7 @@ def build_leaf_proxies(
     dets = np.linalg.det(eigvecs)
     eigvecs[dets < 0, :, -1] *= -1  # fix reflections (det=-1) into proper rotations (det=+1)
 
-    proxy_scale = np.sqrt(eigvals[:, :2]).astype(np.float32)  # [L, 2] -- in-plane only, matches the kernel
+    proxy_scale = np.sqrt(eigvals if keep_normal_axis else eigvals[:, :2]).astype(np.float32)
 
     proxy_rotation = np.empty((n_leaves, 4), dtype=np.float32)
     for leaf in range(n_leaves):

@@ -68,7 +68,13 @@ class RayDropPrior:
         return RayDropPrior(prior=resized)
 
 
-def load_lidar_gaussian_model(path: str | Path, device: str = "cuda") -> LidarGaussianModel:
+def load_lidar_gaussian_model(path: str | Path, device: str = "cuda",
+                               opacity_threshold: float = 0.0) -> LidarGaussianModel:
+    """`opacity_threshold`: see `LidarGaussianModel.prune_low_opacity_` --
+    same "0.0 = off" convention as the camera branch's `load_gaussian_model`.
+    Pass the same value to `culling.py`'s `load_or_build_octree` if also
+    using an octree index (its cache filename is keyed by this value for
+    exactly this reason -- see that function's docstring)."""
     model_args, iteration = torch.load(str(path), map_location=device, weights_only=False)
     model = LidarGaussianModel(
         xyz=model_args[_XYZ].to(device),
@@ -84,8 +90,10 @@ def load_lidar_gaussian_model(path: str | Path, device: str = "cuda") -> LidarGa
         T=float(model_args[_CYCLE_T]),
         velocity_decay=float(model_args[_VELOCITY_DECAY]),
     )
+    n_pruned = model.prune_low_opacity_(opacity_threshold)
+    prune_note = f", pruned {n_pruned:,} at opacity<={opacity_threshold}" if n_pruned else ""
     print(f"[gs_sensor_core] Loaded {model.num_points:,} LiDAR splats "
-          f"(SH degree {model.active_sh_degree}, iteration {iteration}) from {path}")
+          f"(SH degree {model.active_sh_degree}, iteration {iteration}{prune_note}) from {path}")
     return model
 
 

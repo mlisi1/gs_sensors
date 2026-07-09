@@ -86,6 +86,57 @@ class LidarGaussianModel:
     def num_points(self) -> int:
         return self.xyz.shape[0]
 
+    def reorder_(self, perm: torch.Tensor) -> None:
+        """In-place permutation of every raw per-splat tensor -- called
+        once at load time (not per-frame) to put the model into an
+        octree's leaf-contiguous order (perm = that octree's
+        flat_indices), same purpose and pattern as
+        `GaussianModel.reorder_` (models/gaussian_model.py:107-124) for the
+        camera branch -- see that method's docstring for why contiguous
+        leaf slicing beats boolean-mask indexing. Includes the LiDAR-only
+        raw fields (`raw_t`/`raw_scaling_t`/`velocity`) the camera model
+        doesn't have; everything else matches field-for-field."""
+        self.xyz = self.xyz[perm].contiguous()
+        self.raw_opacity = self.raw_opacity[perm].contiguous()
+        self.raw_scaling = self.raw_scaling[perm].contiguous()
+        self.raw_rotation = self.raw_rotation[perm].contiguous()
+        self.features_dc = self.features_dc[perm].contiguous()
+        self.features_rest = self.features_rest[perm].contiguous()
+        self.raw_t = self.raw_t[perm].contiguous()
+        self.raw_scaling_t = self.raw_scaling_t[perm].contiguous()
+        self.velocity = self.velocity[perm].contiguous()
+
+    def prune_low_opacity_(self, opacity_threshold: float) -> int:
+        """In-place: permanently drops splats with activated opacity
+        `<= opacity_threshold` -- same role and same "off-by-default really
+        means off" convention as the camera branch's `compression.py`'s
+        `prune_low_opacity`, ported here as a model method instead of a
+        separate plain-dict function since this loader (`torch.load`, see
+        `lidar_checkpoint_loader.py`) already produces torch tensors
+        directly, unlike the camera branch's numpy-based PLY parse -- no
+        reason to introduce a numpy round-trip that doesn't otherwise
+        exist in this loading path. Call before building/loading an octree
+        index (`culling.py`'s `load_or_build_octree`) with the *same*
+        `opacity_threshold`, same reasoning as the camera branch: pruning
+        changes N, so an octree cached at a different threshold is
+        structurally invalid for what survives here.
+
+        `threshold <= 0.0` is a true no-op (returns 0, changes nothing)."""
+        if opacity_threshold <= 0.0:
+            return 0
+        keep = torch.sigmoid(self.raw_opacity[:, 0].float()) > opacity_threshold
+        n_removed = int((~keep).sum().item())
+        self.xyz = self.xyz[keep].contiguous()
+        self.raw_opacity = self.raw_opacity[keep].contiguous()
+        self.raw_scaling = self.raw_scaling[keep].contiguous()
+        self.raw_rotation = self.raw_rotation[keep].contiguous()
+        self.features_dc = self.features_dc[keep].contiguous()
+        self.features_rest = self.features_rest[keep].contiguous()
+        self.raw_t = self.raw_t[keep].contiguous()
+        self.raw_scaling_t = self.raw_scaling_t[keep].contiguous()
+        self.velocity = self.velocity[keep].contiguous()
+        return n_removed
+
     def get_xyz_SHM(self, t: float) -> torch.Tensor:
         """Splat position at time `t`, following a sinusoidal motion model
         with period `T` -- ported verbatim from

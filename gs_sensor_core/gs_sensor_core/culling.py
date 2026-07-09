@@ -252,6 +252,7 @@ def load_or_build_octree(
     rotation: np.ndarray | None = None,
     features_dc: np.ndarray | None = None,
     opacity_threshold: float = 0.0,
+    keep_normal_axis: bool = False,
 ) -> Octree | None:
     """Loads a cached index if present; builds (and caches) one if
     `build_index` is set and no cache exists; otherwise returns None
@@ -271,7 +272,16 @@ def load_or_build_octree(
     A loaded cache whose point count doesn't match `xyz` (e.g. a stale
     cache from before this per-threshold cache-path split, or `xyz` itself
     changed on disk) fails loudly here rather than crashing confusingly
-    later in GaussianModel.reorder_ with an out-of-range index."""
+    later in GaussianModel.reorder_ with an out-of-range index.
+
+    `keep_normal_axis`: passed straight through to `build_leaf_proxies` --
+    only relevant when `compute_lod=True` for a genuinely-3D-GS-family
+    model (the LiDAR branch), see that function's docstring. Not part of
+    the cache filename (unlike `opacity_threshold`): a cached index's own
+    `proxy_scale` column count already reveals which mode built it (2 vs
+    3 columns), so mixing this flag across runs against the same cache
+    fails loudly via a real shape mismatch at the call site rather than
+    silently, same spirit as the point-count check above."""
     cache_path = index_cache_path(ply_path, opacity_threshold)
     if cache_path.is_file():
         octree = load_octree(cache_path)
@@ -307,7 +317,8 @@ def load_or_build_octree(
         print(f"[gs_sensor_core] Building LOD proxies ({len(octree.node_aabbs):,} leaves) ...")
         (octree.proxy_xyz, octree.proxy_scale, octree.proxy_rotation,
          octree.proxy_opacity, octree.proxy_features_dc) = build_leaf_proxies(
-            octree, xyz, opacity, scale, rotation, features_dc)
+            octree, xyz, opacity, scale, rotation, features_dc,
+            keep_normal_axis=keep_normal_axis)
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     save_octree(cache_path, octree)
     print(f"[gs_sensor_core] Built {len(octree.node_aabbs):,} leaf nodes, saved to {cache_path}")
