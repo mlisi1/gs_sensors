@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "camera_debug_node = gs_sensors_ros.camera_debug_node:main",
+            "lidar_debug_node = gs_sensors_ros.lidar_debug_node:main",
         ],
     },
 )

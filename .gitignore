@@ -1,7 +1,7 @@
 *.md
 __pycache__/
 test_data/
-test_package/
+test_env/
 log/
 install/
 build/

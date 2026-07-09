@@ -1,0 +1,30 @@
+# LiDAR sensor profile for the Crosslab_lidar test model.
+#
+# vfov/hfov/hw are NOT free choices -- pulled verbatim from
+# test_data/Crosslab_lidar/setting.txt (the model's actual training config)
+# since they're baked into what the model learned to reconstruct at, not
+# independent render knobs. See gs_sensor_core/lidar_profiles/schema.py for
+# why hw/hfov are per-half values, not the full stitched panorama.
+#
+# frame_id/update_rate/beam_count are real-driver-facing fields, NOT
+# derivable from the checkpoint -- these are best-effort defaults for a
+# real Velodyne VLP-16 (10 Hz spin rate, 16 physical channels; the
+# training hw height of 32 is a 2x upsampling of that during training, not
+# a real 32-beam sensor -- see docs/coordinate_frames.md notes once written).
+# Confirm against your actual sensor/driver before trusting update_rate or
+# frame_id downstream.
+#
+# scale_factor MUST equal this checkpoint's GSFrameTransform.scale (the
+# transform_poses_pca.npz / scale_factor.txt value used to build the
+# gs_frame_transform this profile is paired with), not an independent
+# choice -- see schema.py's docstring for why (it sets the CUDA kernel's
+# near/far clip planes; the wrong value silently near-clips the whole
+# model). test_data/Crosslab_lidar/scale_factor.txt = 0.1.
+
+vfov: [-15.0, 15.0]
+hfov: [-90, 90]
+hw: [32, 512]
+frame_id: "lidar_optical"
+update_rate: 10.0
+scale_factor: 0.1
+beam_count: 16
