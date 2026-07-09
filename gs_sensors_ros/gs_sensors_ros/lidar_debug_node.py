@@ -41,6 +41,8 @@ class LidarDebugNode(Node):
         self.declare_parameter("refine_unet_path", "")  # empty = raw raydrop, no refinement
         self.declare_parameter("dynamic", False)
         self.declare_parameter("raydrop_threshold", 0.5)
+        self.declare_parameter("range_noise_stddev_m", 0.0)     # 0.0 = off, see LidarRasterizer
+        self.declare_parameter("intensity_noise_stddev", 0.0)   # 0.0 = off, see LidarRasterizer
 
         # Sensor / pose
         self.declare_parameter("lidar_profile", "")
@@ -90,6 +92,8 @@ class LidarDebugNode(Node):
             gs_scale=self.gs_transform.scale,
             dynamic=bool(self.get_parameter("dynamic").value),
             raydrop_threshold=float(self.get_parameter("raydrop_threshold").value),
+            range_noise_stddev_m=float(self.get_parameter("range_noise_stddev_m").value),
+            intensity_noise_stddev=float(self.get_parameter("intensity_noise_stddev").value),
         )
 
         # Same rationale as camera_debug_node.py: a dedicated callback group
@@ -122,6 +126,16 @@ class LidarDebugNode(Node):
         self._first_pose_seen = True
 
         pose_age_s = getattr(self.pose_source, "pose_age_s", lambda: None)()
+        # The pose actually used to render may be older than `stamp` (e.g.
+        # GroundTruthPoseSource ignores `stamp` and returns whatever was
+        # last received) -- publish with the pose's own valid-at timestamp,
+        # not the render loop's `now()`, so a downstream TF-based transform
+        # (RViz's Fixed Frame view) resolves the exact same pose sample
+        # this render used. See pose_source.py's `pose_stamp` docstring --
+        # without this, the published cloud visibly lags TF during
+        # rotation (angular motion displaces far points more per unit time
+        # than linear motion does for the same timestamp gap).
+        publish_stamp = self.pose_source.pose_stamp() or stamp
         pose_gs = self.gs_transform.apply(pose_world)
 
         t0 = time.perf_counter()
@@ -156,7 +170,7 @@ class LidarDebugNode(Node):
             )
 
         header = Header()
-        header.stamp = stamp.to_msg()
+        header.stamp = publish_stamp.to_msg()
         header.frame_id = self.profile.frame_id
         self._points_pub.publish(points_to_pointcloud2_msg(result.points_xyz, result.intensity, header))
 

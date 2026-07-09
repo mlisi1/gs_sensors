@@ -38,7 +38,20 @@ class LidarRasterizer:
     def __init__(self, model: LidarGaussianModel, raydrop_prior: RayDropPrior,
                  profile: LidarProfile, refine_unet: RaydropRefineUNet | None = None,
                  gs_scale: float = 1.0, dynamic: bool = False, device: str = "cuda",
-                 raydrop_threshold: float = 0.5):
+                 raydrop_threshold: float = 0.5,
+                 range_noise_stddev_m: float = 0.0, intensity_noise_stddev: float = 0.0):
+        """`range_noise_stddev_m`/`intensity_noise_stddev`: synthetic
+        per-frame measurement noise -- 0.0 (default) disables each
+        independently, same "empty/zero sentinel = off" convention as
+        `refine_unet_path`. The trained field itself is smooth/deterministic
+        (a continuous function fit by gradient descent across many real
+        frames converges toward the mean return per ray direction, not the
+        raw per-shot noise a real sensor has) -- see CLAUDE.md/TODO.md for
+        why this doesn't come "for free" the way it might from a real
+        capture. `range_noise_stddev_m` perturbs the *range* (radially,
+        before unprojection), matching how real LiDAR accuracy specs are
+        quoted (e.g. VLP-16's "+/-3cm"), not an isotropic 3D xyz jitter,
+        which would distort the unprojection geometry unrealistically."""
         self.model = model
         self.raydrop_prior = raydrop_prior
         self.profile = profile
@@ -47,6 +60,8 @@ class LidarRasterizer:
         self.dynamic = dynamic
         self.device = device
         self.raydrop_threshold = raydrop_threshold
+        self.range_noise_stddev_m = range_noise_stddev_m
+        self.intensity_noise_stddev = intensity_noise_stddev
 
     def render(self, pose_gs: Pose, timestamp: float = 0.0, profile: bool = False) -> LidarRenderResult:
         """`pose_gs` must already be in GS-training space (see frames.py)
@@ -86,8 +101,17 @@ class LidarRasterizer:
                 lap("refine")
 
             depth = pano.depth * (raydrop <= self.raydrop_threshold).float()
+            if self.range_noise_stddev_m > 0.0:
+                valid = depth > 0.0
+                noise_gs = torch.randn_like(depth) * (self.range_noise_stddev_m * self.gs_scale)
+                depth = torch.where(valid, (depth + noise_gs).clamp_min(0.0), depth)
+                lap("range_noise")
+
             points_xyz, points_intensity = pano_to_points(depth, pano.intensity, vfov=self.profile.vfov)
             lap("unproject")
+
+            if self.intensity_noise_stddev > 0.0:
+                points_intensity = points_intensity + torch.randn_like(points_intensity) * self.intensity_noise_stddev
 
             points_xyz = (points_xyz / self.gs_scale).cpu().numpy().astype(np.float32)
             points_intensity = points_intensity.clamp(0.0, 1.0).cpu().numpy().astype(np.float32)

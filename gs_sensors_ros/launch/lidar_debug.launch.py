@@ -35,6 +35,17 @@ def generate_launch_description():
         DeclareLaunchArgument("raydrop_threshold", default_value="0.5",
                               description="Raydrop probability above which a range reading is "
                                           "dropped before unprojecting to points"),
+        DeclareLaunchArgument("range_noise_stddev_m", default_value="0.0",
+                              description="Synthetic per-frame Gaussian noise stddev added to "
+                                          "each valid range reading, in meters, before "
+                                          "unprojection (radial, matching how real LiDAR "
+                                          "accuracy specs are quoted) -- 0.0 (default) disables "
+                                          "it. The trained field itself is smooth/deterministic, "
+                                          "not a substitute for real per-shot sensor noise"),
+        DeclareLaunchArgument("intensity_noise_stddev", default_value="0.0",
+                              description="Synthetic per-frame Gaussian noise stddev added to "
+                                          "each point's intensity ([0,1] range) -- 0.0 (default) "
+                                          "disables it"),
         DeclareLaunchArgument("pose_source", default_value="ground_truth",
                               description="'ground_truth' or 'tf'"),
         DeclareLaunchArgument("ground_truth_topic", default_value="pose"),
@@ -65,6 +76,8 @@ def generate_launch_description():
             "gs_frame_transform": LaunchConfiguration("gs_frame_transform"),
             "dynamic": ParameterValue(LaunchConfiguration("dynamic"), value_type=bool),
             "raydrop_threshold": ParameterValue(LaunchConfiguration("raydrop_threshold"), value_type=float),
+            "range_noise_stddev_m": ParameterValue(LaunchConfiguration("range_noise_stddev_m"), value_type=float),
+            "intensity_noise_stddev": ParameterValue(LaunchConfiguration("intensity_noise_stddev"), value_type=float),
             "pose_source": LaunchConfiguration("pose_source"),
             "ground_truth_topic": LaunchConfiguration("ground_truth_topic"),
             "world_frame": LaunchConfiguration("world_frame"),

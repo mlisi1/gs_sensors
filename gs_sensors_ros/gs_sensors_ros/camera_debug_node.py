@@ -193,6 +193,13 @@ class CameraDebugNode(Node):
         # work -- this is the number that actually says whether the pose
         # used for this frame was fresh or stuck behind a prior render.
         pose_age_s = getattr(self.pose_source, "pose_age_s", lambda: None)()
+        # The pose actually used to render may be older than `stamp` (e.g.
+        # GroundTruthPoseSource ignores `stamp` and returns whatever was
+        # last received) -- publish with the pose's own valid-at timestamp,
+        # not the render loop's `now()`, so a downstream TF-based transform
+        # resolves the exact same pose sample this render used. See
+        # pose_source.py's `pose_stamp` docstring.
+        publish_stamp = self.pose_source.pose_stamp() or stamp
 
         pose_gs = self.gs_transform.apply(pose_world)
 
@@ -236,7 +243,7 @@ class CameraDebugNode(Node):
             debug_view.show(result.rgb, result.depth, self._debug_view_max_depth_m)
 
         header = Header()
-        header.stamp = stamp.to_msg()
+        header.stamp = publish_stamp.to_msg()
         header.frame_id = self.profile.frame_id
 
         self._image_pub.publish(rgb_to_image_msg(result.rgb, header))

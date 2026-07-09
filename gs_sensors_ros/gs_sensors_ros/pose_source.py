@@ -25,6 +25,21 @@ class PoseSource(ABC):
     def get_pose(self, stamp: Time) -> Pose | None:
         """World-frame camera pose at `stamp`, or None if not available yet."""
 
+    def pose_stamp(self) -> Time | None:
+        """The ROS timestamp the last pose returned by `get_pose` is
+        actually valid at -- publish THIS as the render output's own
+        `header.stamp`, not the render loop's own `now()`, so a downstream
+        TF-based transform (e.g. RViz's Fixed Frame view) resolves the
+        exact same pose sample the render was computed from. Default
+        (`None`) means "trust the `stamp` passed into `get_pose`", true for
+        `TFPoseSource` (tf2 already interpolates to give the pose *at* that
+        exact stamp) but NOT for `GroundTruthPoseSource`, which ignores
+        `stamp` and returns whatever was last received -- see its override.
+        Callers should fall back to their own current time when this
+        returns `None` (no pose received yet, or a source that doesn't
+        override it)."""
+        return None
+
 
 class GroundTruthPoseSource(PoseSource):
     """Subscribes to a geometry_msgs/PoseStamped bridged straight from Gazebo
@@ -39,6 +54,7 @@ class GroundTruthPoseSource(PoseSource):
 
     def __init__(self, node: Node, topic: str, callback_group: CallbackGroup | None = None):
         self._latest: Pose | None = None
+        self._latest_stamp: Time | None = None
         self._latest_received_at: float | None = None
         node.create_subscription(PoseStamped, topic, self._on_pose, 10, callback_group=callback_group)
 
@@ -49,10 +65,14 @@ class GroundTruthPoseSource(PoseSource):
             position=np.array([p.x, p.y, p.z]),
             orientation=np.array([o.x, o.y, o.z, o.w]),
         )
+        self._latest_stamp = Time.from_msg(msg.header.stamp)
         self._latest_received_at = time.monotonic()
 
     def get_pose(self, stamp: Time) -> Pose | None:
         return self._latest
+
+    def pose_stamp(self) -> Time | None:
+        return self._latest_stamp
 
     def pose_age_s(self) -> float | None:
         """Wall-clock seconds since the cached pose was received -- a
