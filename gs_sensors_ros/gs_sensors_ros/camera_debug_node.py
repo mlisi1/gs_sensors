@@ -13,7 +13,7 @@ import time
 import rclpy
 import torch
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
@@ -262,10 +262,27 @@ def main(args=None):
     executor.add_node(node)
     try:
         executor.spin()
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # ExternalShutdownException: rclpy's own SIGINT handler can
+        # invalidate the context while executor.spin() is mid-wait,
+        # raising this instead of (or in addition to) KeyboardInterrupt --
+        # both are a normal Ctrl+C, not an error.
+        pass
     finally:
+        # Without this, the executor's worker thread pool is never told to
+        # stop/join -- the process can hang around well after Ctrl+C
+        # waiting for threads that were never signaled to exit. See
+        # lidar_debug_node.py's main() for the same fix.
+        executor.shutdown()
         debug_view.close()
         node.destroy_node()
-        rclpy.shutdown()
+        # rclpy's own SIGINT handler already calls rclpy.shutdown() on the
+        # context before this finally block runs -- calling it again
+        # unconditionally raises RCLError("rcl_shutdown already called"),
+        # a harmless but noisy traceback on every Ctrl+C. rclpy.ok() is
+        # False once that's already happened.
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
