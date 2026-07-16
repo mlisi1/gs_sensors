@@ -1,5 +1,5 @@
 """LiDAR-specific broad-phase visibility/LOD tests, built on the same
-generic octree the camera branch uses (`gs_sensor_core.culling.Octree`/
+generic octree the camera branch uses (`gsplat2d_rendering.culling.Octree`/
 `build_octree`/`load_or_build_octree` -- imported here, not duplicated).
 
 A camera-style frustum test doesn't apply: a LiDAR pose's two panoramic
@@ -12,8 +12,8 @@ resolution (tens of thousands of rays per frame, vs. a camera's millions of
 pixels), most splats subtend an angle far smaller than a single ray's own
 angular pitch -- redundant detail the sensor can't resolve, not something
 invisible. `angular_size_mask_torch` is the level-of-detail decision that
-addresses that (paired with `gs_sensor_core.lod.build_leaf_proxies`, which
-is already fully generic and needs no LiDAR-specific version).
+addresses that (paired with `gsplat2d_rendering.lod.build_leaf_proxies`,
+which is already fully generic and needs no LiDAR-specific version).
 """
 from __future__ import annotations
 

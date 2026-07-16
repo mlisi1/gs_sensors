@@ -33,6 +33,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from gsplat2d_rendering.math_utils.rotations import quat_to_rotmat, rotmat_to_quat
+
 from gs_sensor_core.frames import GSFrameTransform, Pose
 from gs_sensor_core.lidar_profiles.schema import LidarProfile
 from gs_sensor_core.models.lidar_checkpoint_loader import load_lidar_gaussian_model, load_raydrop_prior
@@ -40,7 +42,6 @@ from gs_sensor_core.render.lidar.camera import build_lidar_cameras
 from gs_sensor_core.render.lidar.pointcloud import pano_to_points
 from gs_sensor_core.render.lidar.rasterizer import render_lidar_panorama
 from gs_sensor_core.render.lidar.refine import load_refine_unet, refine_raydrop
-from gs_sensor_core.rotations import quat_to_rotmat, rotmat_to_quat
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CKPT_DIR = REPO_ROOT / "test_data" / "Crosslab_lidar"

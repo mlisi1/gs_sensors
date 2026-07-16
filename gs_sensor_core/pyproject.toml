@@ -14,15 +14,28 @@ dependencies = [
     "plyfile",
 ]
 
-# `diff-surfel-rasterization` (the CUDA tile-sort/alpha-composite kernel this
-# package renders with) is intentionally NOT listed here: it's a compiled
-# CUDA extension vendored as a git submodule at
-# third_party/diff-surfel-rasterization, built via its own setup.py (needs
-# nvcc + a matching torch/CUDA install). Build it once after
+# The camera-splat rendering core itself (PLY load, GaussianModel, SH eval,
+# octree culling/LOD, compression, the diff-surfel-rasterization wrapper) is
+# NOT reimplemented in this package -- it's vendored as the gsplat2d-rendering
+# git submodule at third_party/gsplat2d-rendering (github.com/mlisi1/
+# 2dgs-rendering), which itself vendors diff-surfel-rasterization (the CUDA
+# tile-sort/alpha-composite kernel) as its own nested submodule. `gs_sensor_
+# core` imports it directly (`gsplat2d_rendering.model.GaussianModel`,
+# `.culling`, `.compression`, `.io.ply`, etc.) rather than re-exporting it
+# under gs_sensor_core's own names -- only render/camera.py (Pose/
+# CameraProfile -> gsplat2d_rendering.camera.Camera) and render/pipeline.py
+# (adds the gs_scale metric-depth conversion) are real adapters over it, see
+# their docstrings. Build both, once, after
 # `git submodule update --init --recursive`:
-#   pip install -e gs_sensor_core/third_party/diff-surfel-rasterization
-# It carries the Inria Gaussian-Splatting research license (non-commercial
-# use only) -- see that submodule's LICENSE.md.
+#   pip install -e gs_sensor_core/third_party/gsplat2d-rendering
+#   pip install -e gs_sensor_core/third_party/gsplat2d-rendering/third_party/diff-surfel-rasterization
+# (needs nvcc + a matching torch/CUDA install for the second one). The CUDA
+# kernel carries the Inria Gaussian-Splatting research license
+# (non-commercial use only) -- see that nested submodule's LICENSE.md.
+#
+# The LiDAR branch (render/lidar/*, models/lidar_*, lidar_profiles/*) has no
+# equivalent in gsplat2d-rendering yet -- it still renders via the separate
+# third_party/GS-LiDAR submodule directly. See MIGRATION_GAPS.md.
 
 [tool.setuptools.packages.find]
 include = ["gs_sensor_core*"]

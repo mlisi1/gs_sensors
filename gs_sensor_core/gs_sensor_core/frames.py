@@ -19,7 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
-from gs_sensor_core.rotations import quat_mul, quat_normalize, quat_to_rotmat, rotmat_to_quat
+from gsplat2d_rendering.math_utils.rotations import quat_mul, quat_normalize, quat_to_rotmat, rotmat_to_quat
 
 
 @dataclass(frozen=True)

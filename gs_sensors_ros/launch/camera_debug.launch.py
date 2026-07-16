@@ -24,7 +24,7 @@ def generate_launch_description():
                               description="Path to a gs_T_world transform JSON (empty = identity)"),
         DeclareLaunchArgument("sh_degree", default_value="-1"),
         DeclareLaunchArgument("compression_level", default_value="0",
-                              description="0 (none) - 3 (aggressive); see gs_sensor_core/compression.py"),
+                              description="0 (none) - 3 (aggressive); see gsplat2d_rendering.compression"),
         DeclareLaunchArgument("target_sh_degree", default_value="1",
                               description="Only used at compression_level 2"),
         DeclareLaunchArgument("opacity_threshold", default_value="0.0",
@@ -34,7 +34,7 @@ def generate_launch_description():
                                           "test model that removes ~67% of all splats (median "
                                           "opacity across the whole model is ~0.004), so this is "
                                           "not a marginal cut. Off by default pending visual "
-                                          "verification -- see gs_sensor_core/compression.py's "
+                                          "verification -- see gsplat2d_rendering.compression's "
                                           "prune_low_opacity"),
         DeclareLaunchArgument("culling_enabled", default_value="true",
                               description="Octree frustum culling (GPU-native)"),

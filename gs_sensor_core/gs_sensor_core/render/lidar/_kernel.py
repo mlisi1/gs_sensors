@@ -23,8 +23,8 @@ instead -- it does not modify the submodule's own files, so the vendored
 tree stays a clean, diffable copy of upstream.
 
 JIT compilation happens on first call to `load_kernel()`, not at import
-time -- mirrors `render/rasterizer.py`'s `GaussianRasterizerWrapper.__init__`
-importing `diff_surfel_rasterization` lazily, so importing gs_sensor_core
+time -- mirrors gsplat2d_rendering's `render/rasterizer.py::SplatRenderer.
+__init__` importing `diff_surfel_rasterization` lazily, so importing gs_sensor_core
 doesn't force a slow (and CUDA-toolchain-dependent) compile for callers who
 only need the camera branch. Compiles once per environment; PyTorch's
 extension loader caches the built `.so` under `~/.cache/torch_extensions/`

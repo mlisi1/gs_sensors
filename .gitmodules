@@ -1,6 +1,6 @@
-[submodule "gs_sensor_core/third_party/diff-surfel-rasterization"]
-	path = gs_sensor_core/third_party/diff-surfel-rasterization
-	url = https://github.com/hbb1/diff-surfel-rasterization.git
 [submodule "gs_sensor_core/third_party/GS-LiDAR"]
 	path = gs_sensor_core/third_party/GS-LiDAR
 	url = https://github.com/mlisi1/GS-LiDAR.git
+[submodule "gs_sensor_core/third_party/gsplat2d-rendering"]
+	path = gs_sensor_core/third_party/gsplat2d-rendering
+	url = git@github.com:mlisi1/2dgs-rendering.git

@@ -14,9 +14,9 @@ The forward/backward relationship (`R_backward = R_forward @ diag(-1, 1,
 `towards == 'backward'` branch negates exactly those two direction
 components relative to `'forward'`.
 
-Same view-matrix convention as the camera branch's `render/camera.py`
-(`world_view_transform = (W2C).T`, no separate projection matrix -- GS-
-LiDAR's own `Camera.__init__` sets `projection_matrix = eye(4)`, i.e.
+Same view-matrix convention as the camera branch's `gsplat2d_rendering.
+camera` (`world_view_transform = (W2C).T`, no separate projection matrix --
+GS-LiDAR's own `Camera.__init__` sets `projection_matrix = eye(4)`, i.e.
 `full_proj_transform == world_view_transform`; confirmed by reading
 `~/GS-LiDAR/scene/cameras.py`, not assumed, since the vendored kernel takes
 vfov/hfov directly and does its own equirectangular projection instead of
@@ -36,9 +36,10 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from gsplat2d_rendering.math_utils.rotations import quat_to_rotmat
+
 from gs_sensor_core.frames import Pose
 from gs_sensor_core.lidar_profiles.schema import LidarProfile
-from gs_sensor_core.rotations import quat_to_rotmat
 
 _FLIP_LOCAL_XZ = np.diag([-1.0, 1.0, -1.0])
 

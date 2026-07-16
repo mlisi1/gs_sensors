@@ -18,10 +18,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import CameraInfo, Image
 from std_msgs.msg import Header
 
+from gsplat2d_rendering import load_gaussian_model, load_or_build_octree, resolve_ply_path
+
 from gs_sensor_core.camera_profiles.schema import CameraProfile
-from gs_sensor_core.culling import load_or_build_octree
 from gs_sensor_core.frames import GSFrameTransform, load_gs_frame_transform
-from gs_sensor_core.models import load_gaussian_model, resolve_ply_path
 from gs_sensor_core.render import CameraRasterizer
 
 from gs_sensors_ros import debug_view
@@ -42,7 +42,7 @@ class CameraDebugNode(Node):
         self.declare_parameter("target_sh_degree", 1)
         self.declare_parameter("opacity_threshold", 0.0)
 
-        # Culling / LOD (see gs_sensor_core/culling.py, lod.py, render/rasterizer.py)
+        # Culling / LOD (see gsplat2d_rendering's culling/, lod.py, render/rasterizer.py)
         self.declare_parameter("culling_enabled", True)
         self.declare_parameter("culling_narrow_phase", False)
         self.declare_parameter("culling_margin", 0.0)
@@ -74,7 +74,7 @@ class CameraDebugNode(Node):
             raise RuntimeError("Both 'ply_path' and 'camera_profile' parameters are required")
 
         # Accepts either a direct .ply, or a training model directory (resolved
-        # via 'iterations') -- see gs_sensor_core.models.paths.resolve_ply_path.
+        # via 'iterations') -- see gsplat2d_rendering.io.paths.resolve_ply_path.
         ply_path = resolve_ply_path(ply_path_param, iterations=self.get_parameter("iterations").value)
 
         self.profile = CameraProfile.from_yaml(profile_path)

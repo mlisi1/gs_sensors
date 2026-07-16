@@ -21,7 +21,8 @@ from rclpy.node import Node
 from sensor_msgs.msg import PointCloud2
 from std_msgs.msg import Header
 
-from gs_sensor_core.culling import load_or_build_octree
+from gsplat2d_rendering import load_or_build_octree
+
 from gs_sensor_core.frames import GSFrameTransform, load_gs_frame_transform
 from gs_sensor_core.lidar_profiles.schema import LidarProfile
 from gs_sensor_core.models.lidar_checkpoint_loader import load_lidar_gaussian_model, load_raydrop_prior

@@ -12,7 +12,9 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from gs_sensor_core.culling import Octree
+from gsplat2d_rendering.culling import Octree
+from gsplat2d_rendering.math_utils.rotations import quat_to_rotmat
+
 from gs_sensor_core.frames import Pose
 from gs_sensor_core.lidar_profiles.schema import LidarProfile
 from gs_sensor_core.models.lidar_checkpoint_loader import RayDropPrior
@@ -22,11 +24,10 @@ from gs_sensor_core.render.lidar.culling import angular_size_mask_torch, visible
 from gs_sensor_core.render.lidar.pointcloud import pano_to_points
 from gs_sensor_core.render.lidar.rasterizer import render_lidar_panorama
 from gs_sensor_core.render.lidar.refine import RaydropRefineUNet, refine_raydrop
-from gs_sensor_core.rotations import quat_to_rotmat
 
 # Positional order matching LidarGaussianModel's raw-tensor fields -- used by
 # _gather_leaf_slices/_append_proxies below, same "raw tuple" convention
-# render/rasterizer.py's camera-branch equivalent uses.
+# gsplat2d_rendering's render/rasterizer.py (the camera-branch equivalent) uses.
 _RAW_FIELDS = (
     "xyz", "raw_opacity", "raw_scaling", "raw_rotation",
     "features_dc", "features_rest", "raw_t", "raw_scaling_t", "velocity",
@@ -149,7 +150,8 @@ class LidarRasterizer:
 
     def _gather_leaf_slices(self, leaf_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         """Same single-index contiguous gather as the camera branch's
-        `_gather_leaf_slices` (render/rasterizer.py) -- touches only the
+        `_gather_leaf_slices` (gsplat2d_rendering's render/rasterizer.py) --
+        touches only the
         visible K points, never the full N. Returns a dict keyed by
         `_RAW_FIELDS` so the caller can build a `LidarGaussianModel`
         directly from it."""
